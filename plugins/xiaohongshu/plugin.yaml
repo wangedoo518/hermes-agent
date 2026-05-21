@@ -1,0 +1,7 @@
+name: xiaohongshu
+version: 0.1.0
+description: "Xiaohongshu note extraction tools. Extract one user-submitted image-text or video note link into local note.json and note.md files."
+author: azan / Hermes Agent contributors
+kind: backend
+provides_tools:
+  - xhs_extract_note
