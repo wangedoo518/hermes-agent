@@ -28,6 +28,7 @@ Usage:
     )
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -805,9 +806,43 @@ async def vision_analyze_tool(
         }
         if model:
             call_kwargs["model"] = model
+        codex_sync_client = None
+        codex_sync_model = None
+        try:
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            vision_provider, sync_client, resolved_vision_model = resolve_vision_provider_client(
+                model=model,
+                async_mode=False,
+            )
+            if vision_provider == "openai-codex" and sync_client is not None:
+                codex_sync_client = sync_client
+                codex_sync_model = resolved_vision_model or model
+        except Exception:
+            codex_sync_client = None
+            codex_sync_model = None
+
+        async def _call_vision_model():
+            if codex_sync_client is not None:
+                # Codex OAuth's image path is the Responses API. The generic
+                # async OpenAI chat client can hit /chat/completions on
+                # chatgpt.com and trip Cloudflare; Hermes's sync
+                # CodexAuxiliaryClient already performs the correct
+                # chat->Responses translation, so run that adapter in a
+                # worker thread for this async tool.
+                def _sync_call():
+                    return codex_sync_client.chat.completions.create(
+                        messages=messages,
+                        model=codex_sync_model,
+                        timeout=vision_timeout,
+                    )
+
+                return await asyncio.to_thread(_sync_call)
+            return await async_call_llm(**call_kwargs)
+
         # Try full-size image first; on size-related rejection, downscale and retry.
         try:
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_vision_model()
         except Exception as _api_err:
             if (_is_image_size_error(_api_err)
                     and len(image_data_url) > _RESIZE_TARGET_BYTES):
@@ -820,7 +855,7 @@ async def vision_analyze_tool(
                 image_data_url = _resize_image_for_vision(
                     temp_image_path, mime_type=detected_mime_type)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
-                response = await async_call_llm(**call_kwargs)
+                response = await _call_vision_model()
             else:
                 raise
         
@@ -830,7 +865,7 @@ async def vision_analyze_tool(
         # Retry once on empty content (reasoning-only response)
         if not analysis:
             logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
+            response = await _call_vision_model()
             analysis = extract_content_or_reasoning(response)
 
         analysis_length = len(analysis)
