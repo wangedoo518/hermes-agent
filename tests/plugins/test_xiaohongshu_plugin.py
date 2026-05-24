@@ -234,6 +234,7 @@ def test_xhs_cookie_from_file_accepts_name_value_mapping(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("HERMES_XHS_COOKIE", raising=False)
     monkeypatch.delenv("XHS_COOKIE", raising=False)
+    monkeypatch.delenv("HERMES_XHS_COOKIE_FILE", raising=False)
     monkeypatch.setenv("XHS_COOKIE_FILE", str(cookie_file))
 
     cookie = xhs._xhs_cookie_from_env()
@@ -981,6 +982,451 @@ def test_extract_note_enriches_title_and_body_from_browser_cdp_dom(tmp_path, mon
     assert payload["raw_metadata"]["browser_dom"]["content_chars"] > 0
 
 
+def test_extracts_profile_notes_from_html_anchors_and_initial_state():
+    note_id_a = "65b7b9d00000000001001234"
+    note_id_b = "69da513a0000000023005dfa"
+    html = f"""
+    <html>
+      <head>
+        <meta property="og:title" content="路飞设计沉思录 - 小红书">
+        <meta property="og:description" content="UIUX 设计求职与模拟面试">
+      </head>
+      <body>
+        <a href="/explore/{note_id_a}?xsec_token=tok-a" title="148秒沉浸式校招面试模拟"></a>
+        <script>
+          window.__INITIAL_STATE__ = {{
+            "user": {{
+              "notes": [
+                {{
+                  "noteId": "{note_id_b}",
+                  "displayTitle": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+                  "type": "video",
+                  "interactInfo": {{
+                    "likedCount": "2802",
+                    "collectedCount": "314",
+                    "commentCount": "143"
+                  }}
+                }}
+              ]
+            }}
+          }};
+        </script>
+      </body>
+    </html>
+    """
+
+    parsed = xhs._extract_profile_notes_from_html(
+        html,
+        base_url="https://www.xiaohongshu.com/user/profile/5f5b897100000000010068c1",
+    )
+
+    assert parsed["profile"]["nickname"] == "路飞设计沉思录"
+    by_id = {item["note_id"]: item for item in parsed["notes"]}
+    assert by_id[note_id_a]["title"] == "148秒沉浸式校招面试模拟"
+    assert by_id[note_id_a]["xsec_token"] == "tok-a"
+    assert by_id[note_id_b]["title"] == "vol.13 字节UI/UX设计岗模拟面试（压力面）"
+    assert by_id[note_id_b]["likes"] == 2802
+    assert by_id[note_id_b]["collects"] == 314
+    assert by_id[note_id_b]["comments"] == 143
+
+
+def test_extract_profile_notes_writes_profile_files(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    profile_id = "5f5b897100000000010068c1"
+    note_id = "69da513a0000000023005dfa"
+    html = f"""
+    <html>
+      <head><meta property="og:title" content="路飞设计沉思录 - 小红书"></head>
+      <body><a href="/explore/{note_id}?xsec_token=tok" title="压力面模拟"></a></body>
+    </html>
+    """
+
+    async def fake_fetch_page(url):
+        return xhs.PageFetch(
+            original_url=url,
+            final_url=f"https://www.xiaohongshu.com/user/profile/{profile_id}?xsec_source=pc_note",
+            html_text=html,
+            status_code=200,
+        )
+
+    async def fake_fetch_profile_from_cdp(*args, **kwargs):
+        return ({}, [])
+
+    monkeypatch.setattr(xhs, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr(xhs, "_fetch_profile_notes_from_browser_cdp", fake_fetch_profile_from_cdp)
+
+    result = asyncio.run(
+        xhs.extract_xhs_profile_notes(
+            f"https://www.xiaohongshu.com/user/profile/{profile_id}",
+            prefer_cdp=True,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["profile_id"] == profile_id
+    assert result["note_count"] == 1
+    saved = json.loads(Path(result["profile_json_path"]).read_text(encoding="utf-8"))
+    assert saved["notes"][0]["note_id"] == note_id
+    assert "压力面模拟" in Path(result["profile_md_path"]).read_text(encoding="utf-8")
+
+
+def test_fetch_profile_notes_from_browser_cdp_auto_navigates(monkeypatch):
+    profile_id = "5f5b897100000000010068c1"
+    note_id = "69da513a0000000023005dfa"
+    profile_url = f"https://www.xiaohongshu.com/user/profile/{profile_id}?xsec_source=pc_search"
+    opened = []
+    evaluated = []
+
+    async def fake_fetch_targets(cdp_base_url):
+        if not opened:
+            return []
+        return [
+            {
+                "type": "page",
+                "url": profile_url,
+                "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1",
+            }
+        ]
+
+    async def fake_open_target(cdp_base_url, url):
+        opened.append((cdp_base_url, url))
+        return {
+            "type": "page",
+            "url": url,
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/page/1",
+        }
+
+    async def fake_evaluate(ws_url, expression, *, await_promise=False):
+        evaluated.append((ws_url, await_promise, "profile_dom" in expression))
+        if "profile_dom" not in expression and "readyState" in expression:
+            return {"href": profile_url, "readyState": "complete"}
+        return {
+            "profile": {
+                "platform": "xiaohongshu",
+                "profile_id": profile_id,
+                "profile_url": profile_url,
+                "nickname": "路飞设计沉思录",
+            },
+            "notes": [
+                {
+                    "note_id": note_id,
+                    "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                    "title": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+                    "note_type": "video",
+                    "stats": {
+                        "status": "ok",
+                        "source": "browser_cdp:profile_dom",
+                        "like_count": 2802,
+                        "collect_count": None,
+                        "comment_count": None,
+                        "share_count": None,
+                    },
+                    "source": "browser_cdp:profile_dom",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(xhs, "_cdp_http_base_url", lambda: "http://127.0.0.1:9222")
+    monkeypatch.setattr(xhs, "_fetch_cdp_targets", fake_fetch_targets)
+    monkeypatch.setattr(xhs, "_open_cdp_target", fake_open_target)
+    monkeypatch.setattr(xhs, "_browser_cdp_runtime_evaluate", fake_evaluate)
+
+    payload, warnings = asyncio.run(
+        xhs._fetch_profile_notes_from_browser_cdp(
+            profile_url,
+            max_notes=20,
+            scroll_rounds=2,
+            auto_navigate=True,
+        )
+    )
+
+    assert opened == [("http://127.0.0.1:9222", profile_url)]
+    assert payload["profile"]["nickname"] == "路飞设计沉思录"
+    assert payload["notes"][0]["note_id"] == note_id
+    assert payload["notes"][0]["likes"] == 2802
+    assert any("opened through Browser/CDP" in item for item in warnings)
+    assert any(item[2] for item in evaluated)
+
+
+def test_parse_profile_dom_payload_preserves_app_api_pagination_metadata():
+    note_id = "673dec240000000006014e88"
+    payload = {
+        "profile": {"profile_id": "5f5b897100000000010068c1"},
+        "app_api_pages": 1,
+        "has_more": False,
+        "cursor": "",
+        "notes": [
+            {
+                "note_id": note_id,
+                "url": f"https://www.xiaohongshu.com/explore/{note_id}",
+                "title": "设计师毕业后去大公司还是小公司？",
+                "note_type": "video",
+                "stats": {
+                    "status": "ok",
+                    "source": "browser_cdp:app_api",
+                    "like_count": 257,
+                },
+                "source": "browser_cdp:app_api",
+            }
+        ],
+    }
+
+    parsed = xhs._parse_profile_dom_payload(payload)
+
+    assert parsed["app_api_pages"] == 1
+    assert parsed["has_more"] is False
+    assert parsed["notes"][0]["note_id"] == note_id
+    assert parsed["notes"][0]["likes"] == 257
+    assert parsed["notes"][0]["source"] == "browser_cdp:app_api"
+
+
+def test_ingest_account_to_wiki_bulk_ingests_extracted_notes(tmp_path):
+    wiki_path = tmp_path / "lufei-xhs-wiki"
+    profile_dir = tmp_path / ".hermes" / "cache" / "xiaohongshu" / "profiles" / "5f5b897100000000010068c1"
+    note_dir = tmp_path / ".hermes" / "cache" / "xiaohongshu" / "69da513a0000000023005dfa"
+    profile_dir.mkdir(parents=True)
+    note_dir.mkdir(parents=True)
+
+    note_payload = {
+        "platform": "xiaohongshu",
+        "note_id": "69da513a0000000023005dfa",
+        "note_type": "video",
+        "source_url": "https://www.xiaohongshu.com/explore/69da513a0000000023005dfa",
+        "title": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+        "content": "压力面模拟。",
+        "author": {"nickname": "路飞设计沉思录"},
+        "stats": {"status": "ok", "like_count": 2802, "collect_count": 314, "comment_count": 143},
+        "likes": 2802,
+        "collects": 314,
+        "comments": 143,
+        "transcript": {"status": "ok", "text": "欢迎来到字节 UI/UX 设计岗模拟面试。"},
+        "comment_threads": {"status": "ok", "items": []},
+    }
+    (note_dir / "note.json").write_text(json.dumps(note_payload, ensure_ascii=False), encoding="utf-8")
+    (note_dir / "note.md").write_text("# vol.13 字节UI/UX设计岗模拟面试（压力面）\n", encoding="utf-8")
+
+    profile_payload = {
+        "platform": "xiaohongshu",
+        "profile": {"profile_id": "5f5b897100000000010068c1", "nickname": "路飞设计沉思录"},
+        "notes": [{"note_id": "69da513a0000000023005dfa", "title": note_payload["title"]}],
+        "note_count": 1,
+    }
+    profile_json_path = profile_dir / "profile.json"
+    profile_json_path.write_text(json.dumps(profile_payload, ensure_ascii=False), encoding="utf-8")
+    (profile_dir / "all_notes_extraction_report.json").write_text(
+        json.dumps(
+            {
+                "profile_id": "5f5b897100000000010068c1",
+                "notes": [
+                    {
+                        "note_id": "69da513a0000000023005dfa",
+                        "note_json_path": str(note_dir / "note.json"),
+                        "note_md_path": str(note_dir / "note.md"),
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = xhs.ingest_account_to_wiki(profile_json_path=str(profile_json_path), wiki_path=str(wiki_path))
+
+    raw_note = wiki_path / "raw" / "xhs" / "notes" / "69da513a0000000023005dfa" / "note.md"
+    copied_report = wiki_path / "raw" / "xhs" / "profile" / "5f5b897100000000010068c1" / "all_notes_extraction_report.json"
+    assert result["success"] is True
+    assert result["ingested_notes_count"] == 1
+    assert result["missing_note_artifacts_count"] == 0
+    assert result["note_ingest_error_count"] == 0
+    assert raw_note.exists()
+    assert copied_report.exists()
+    assert (wiki_path / "_derived" / "manifest.json").exists()
+
+
+def test_lufei_wiki_init_ingest_manifest_and_query(tmp_path):
+    wiki_path = tmp_path / "lufei-xhs-wiki"
+    init_result = xhs.init_lufei_wiki(wiki_path=str(wiki_path))
+
+    assert init_result["success"] is True
+    assert (wiki_path / "persona.md").exists()
+    assert (wiki_path / "raw" / "xhs" / "notes").exists()
+
+    note_payload = {
+        "platform": "xiaohongshu",
+        "note_id": "69da513a0000000023005dfa",
+        "note_type": "video",
+        "source_url": "https://www.xiaohongshu.com/explore/69da513a0000000023005dfa",
+        "resolved_url": "https://www.xiaohongshu.com/explore/69da513a0000000023005dfa?xsec_token=tok",
+        "title": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+        "content": "压力面来了，希望你不会遇到。",
+        "author": {"nickname": "路飞设计沉思录"},
+        "stats": {
+            "status": "ok",
+            "source": "browser_cdp:dom",
+            "like_count": 2802,
+            "collect_count": 314,
+            "comment_count": 143,
+            "share_count": 7,
+        },
+        "likes": 2802,
+        "collects": 314,
+        "comments": 143,
+        "shares": 7,
+        "comment_threads": {
+            "status": "ok",
+            "source": "browser_cdp:dom",
+            "count": 1,
+            "items": [
+                {
+                    "id": "c1",
+                    "text": "压力面这个方向很有用",
+                    "author": {"nickname": "用户A"},
+                    "like_count": 3,
+                    "replies": [],
+                }
+            ],
+        },
+        "transcript": {
+            "status": "ok",
+            "provider": "test",
+            "language": "zh",
+            "text": "我们今天来做一个字节 UI UX 设计岗压力面模拟。",
+            "segments": [],
+        },
+    }
+    note_dir = tmp_path / "note"
+    note_dir.mkdir()
+    note_json_path = note_dir / "note.json"
+    note_json_path.write_text(json.dumps(note_payload, ensure_ascii=False), encoding="utf-8")
+
+    ingest_result = xhs.ingest_note_to_wiki(
+        note_json_path=str(note_json_path),
+        wiki_path=str(wiki_path),
+    )
+
+    assert ingest_result["success"] is True
+    raw_note = Path(ingest_result["raw_note_md_path"])
+    assert raw_note.exists()
+    raw_text = raw_note.read_text(encoding="utf-8")
+    assert "source_url" in raw_text
+    assert "sha256" in raw_text
+    assert "字节 UI UX" in raw_text
+
+    manifest = xhs.build_wiki_manifest(wiki_path=str(wiki_path))
+    assert manifest["file_count"] > 0
+    assert any(item["path"].endswith("note.md") for item in manifest["files"])
+
+    query = xhs.query_wiki_context(
+        query="字节 UIUX 压力面",
+        wiki_path=str(wiki_path),
+        max_files=5,
+    )
+    assert query["matches"]
+    assert "压力面" in query["context"]
+
+
+def test_ingest_account_to_wiki_and_open_in_obsidian(tmp_path, monkeypatch):
+    vault_path = tmp_path / "ObsidianVault"
+    wiki_path = vault_path / "lufei-xhs-wiki"
+    profile_id = "5f5b897100000000010068c1"
+    profile_payload = {
+        "platform": "xiaohongshu",
+        "profile": {
+            "platform": "xiaohongshu",
+            "profile_id": profile_id,
+            "profile_url": f"https://www.xiaohongshu.com/user/profile/{profile_id}",
+            "nickname": "路飞设计沉思录",
+            "description": "UIUX 设计求职与模拟面试",
+        },
+        "notes": [
+            {
+                "note_id": "69da513a0000000023005dfa",
+                "url": "https://www.xiaohongshu.com/explore/69da513a0000000023005dfa",
+                "title": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+                "note_type": "video",
+                "likes": 2802,
+                "collects": 314,
+                "comments": 143,
+                "source": "browser_cdp:profile_dom",
+            }
+        ],
+        "note_count": 1,
+        "warnings": [],
+        "extracted_at": "2026-05-22T00:00:00+00:00",
+    }
+    profile_json_path = tmp_path / "profile.json"
+    profile_json_path.write_text(json.dumps(profile_payload, ensure_ascii=False), encoding="utf-8")
+
+    calls = []
+
+    def fake_which(name):
+        return "/usr/local/bin/obsidian" if name == "obsidian" else None
+
+    def fake_run_obsidian_cli(args, *, timeout=8.0):
+        calls.append(args)
+        if args == ["vault", "info=path"]:
+            return (True, str(vault_path), "")
+        if args == ["open", "path=lufei-xhs-wiki/index.md"]:
+            return (True, "", "")
+        return (False, "", "unexpected")
+
+    monkeypatch.setattr(xhs.shutil, "which", fake_which)
+    monkeypatch.setattr(xhs, "_run_obsidian_cli", fake_run_obsidian_cli)
+
+    result = xhs.ingest_account_to_wiki(
+        profile_json_path=str(profile_json_path),
+        wiki_path=str(wiki_path),
+    )
+
+    assert result["success"] is True
+    assert result["obsidian"]["inside_active_vault"] is True
+    assert Path(result["raw_profile_md_path"]).exists()
+    assert "字节UI/UX" in Path(result["raw_profile_md_path"]).read_text(encoding="utf-8")
+    assert (wiki_path / "queries" / "account-note-inventory.md").exists()
+
+    open_result = xhs.open_wiki_in_obsidian(wiki_path=str(wiki_path))
+    assert open_result["success"] is True
+    assert ["open", "path=lufei-xhs-wiki/index.md"] in calls
+
+
+def test_run_content_skill_invokes_local_pipeline(tmp_path, monkeypatch):
+    pipeline = tmp_path / "xhs-content-pipeline"
+    runner = pipeline / "run_skill.py"
+    runner.parent.mkdir(parents=True)
+    runner.write_text("# runner placeholder\n", encoding="utf-8")
+    input_path = tmp_path / "input.md"
+    input_path.write_text("标题：压力面\n逐字稿：测试", encoding="utf-8")
+
+    class FakeCompleted:
+        returncode = 0
+        stdout = "# 拆解结果\n"
+        stderr = "ok\n"
+
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeCompleted()
+
+    monkeypatch.setattr(xhs.subprocess, "run", fake_run)
+
+    result = xhs.run_content_skill(
+        skill="viral-analysis",
+        input_path=str(input_path),
+        pipeline_path=str(pipeline),
+        model="claude-t0",
+    )
+
+    assert result["success"] is True
+    assert result["content"] == "# 拆解结果\n"
+    assert captured["cwd"] == str(pipeline)
+    assert "viral-analysis" in captured["cmd"]
+    assert "--model" in captured["cmd"]
+
+
 def test_handler_returns_error_for_missing_xhs_url():
     raw = asyncio.run(xhs.xhs_extract_note_handler({"url": "not a xhs link"}))
     payload = json.loads(raw)
@@ -1002,3 +1448,9 @@ def test_plugin_registers_tool():
     assert calls[0]["name"] == "xhs_extract_note"
     assert calls[0]["toolset"] == "xhs"
     assert calls[0]["is_async"] is True
+    names = {call["name"] for call in calls}
+    assert "xhs_extract_profile_notes" in names
+    assert "xhs_ingest_note_to_wiki" in names
+    assert "xhs_ingest_account_to_wiki" in names
+    assert "xhs_query_wiki_context" in names
+    assert "xhs_open_wiki_in_obsidian" in names

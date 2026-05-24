@@ -2398,6 +2398,12 @@ class AIAgent:
             import httpx as _httpx
             import socket as _socket
 
+            if base_url_host_matches(str(base_url or ""), "chatgpt.com"):
+                # The ChatGPT Codex backend streams correctly with httpx's
+                # default transport, but a custom HTTPTransport with socket
+                # options can hang at connect time on macOS network setups.
+                return None
+
             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
             if hasattr(_socket, "TCP_KEEPIDLE"):
                 _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))

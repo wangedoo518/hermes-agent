@@ -9,10 +9,13 @@ env vars were silently ignored for the primary chat client, causing requests
 to bypass local proxies (Clash, corporate egress, etc.) and hit upstream
 directly from the raw interface.
 
-For users on WSL2 + Clash TUN this surfaced as Cloudflare ``cf-mitigated:
-challenge`` 403s against ``chatgpt.com/backend-api/codex`` once they upgraded
-past #11277. The fix forwards the proxy URL explicitly to ``httpx.Client``
-while keeping the keepalive-enabled transport in place.
+For users on WSL2 + Clash TUN this surfaced as upstream requests bypassing the
+configured proxy once they upgraded past #11277. The fix forwards the proxy URL
+explicitly to ``httpx.Client`` while keeping the keepalive-enabled transport in
+place for normal endpoints. ``chatgpt.com/backend-api/codex`` is intentionally
+excluded because httpx's default transport reaches that SSE endpoint reliably
+on macOS setups where a custom ``HTTPTransport(socket_options=...)`` can hang at
+connect time.
 
 This test pins that the constructed ``httpx.Client`` mounts an ``HTTPProxy``
 pool when a proxy env var is set, AND that the socket-level keepalive
@@ -91,7 +94,7 @@ def test_create_openai_client_routes_via_proxy_when_env_set(mock_openai, monkeyp
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://api.openai.com/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -126,7 +129,7 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
     agent = _make_agent()
     kwargs = {
         "api_key": "test-key",
-        "base_url": "https://chatgpt.com/backend-api/codex",
+        "base_url": "https://api.openai.com/v1",
     }
     agent._create_openai_client(kwargs, reason="test", shared=False)
 
@@ -143,6 +146,29 @@ def test_create_openai_client_no_proxy_when_env_unset(mock_openai, monkeypatch):
         "pools were %r" % (pool_types,)
     )
     http_client.close()
+
+
+@patch("run_agent.OpenAI")
+def test_create_openai_client_uses_default_transport_for_chatgpt_codex(mock_openai, monkeypatch):
+    """Codex OAuth backend should use the SDK/httpx default transport.
+
+    The custom keepalive transport is valuable for most providers, but this
+    endpoint streams correctly with the default transport and can connect-timeout
+    with a custom ``HTTPTransport(socket_options=...)`` on macOS networks.
+    """
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        monkeypatch.delenv(key, raising=False)
+
+    agent = _make_agent()
+    kwargs = {
+        "api_key": "test-key",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    }
+    agent._create_openai_client(kwargs, reason="test", shared=False)
+
+    forwarded = mock_openai.call_args.kwargs
+    assert _extract_http_client(forwarded) is None
 
 
 def test_get_proxy_for_base_url_returns_none_when_host_bypassed(monkeypatch):
