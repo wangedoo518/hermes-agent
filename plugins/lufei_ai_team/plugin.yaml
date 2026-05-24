@@ -1,0 +1,10 @@
+name: lufei_ai_team
+version: 0.1.0
+description: "Lufei AI Team Kanban orchestration tools. Turn a raw WeChat/chat/XHS input into a Hermes Kanban swarm with role-specific workers and quality gates."
+author: azan / Hermes Agent contributors
+kind: backend
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - lufei_ai_team_orchestrate

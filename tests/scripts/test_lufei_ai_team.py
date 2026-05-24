@@ -42,6 +42,7 @@ def test_render_soul_contains_lufei_operating_boundaries() -> None:
     assert "Chairman: 路飞本人" in soul
     assert "不自动发布小红书" in soul
     assert "Kanban" in soul
+    assert "lufei-ops-orchestrator" in soul
 
 
 def test_xhs_content_swarm_routes_existing_pipeline() -> None:
@@ -53,9 +54,12 @@ def test_xhs_content_swarm_routes_existing_pipeline() -> None:
     )
     command_text = module.shell_join(command)
 
-    assert command[:3] == ["hermes", "kanban", "swarm"]
+    assert Path(command[0]).name == "hermes"
+    assert command[1:3] == ["kanban", "swarm"]
     assert any(part.startswith("lufei-page:") for part in command)
     assert any(part.startswith("lufei-hastings:") for part in command)
+    assert "lufei-data-intake" in command_text
+    assert "lufei-content-studio" in command_text
     assert "--verifier lufei-altman" in command_text
     assert "--synthesizer lufei-ceo" in command_text
     assert "run:retry-1" in command_text
@@ -70,11 +74,52 @@ def test_task_body_names_acceptance_criteria() -> None:
     assert "test input" in body
 
 
+def test_xhs_note_context_handles_existing_and_new_raw(tmp_path) -> None:
+    module = load_module()
+    note_id = "69da513a0000000023005dfa"
+    url = f"https://www.xiaohongshu.com/explore/{note_id}?xsec_source=pc_user"
+
+    missing = module.xhs_note_context_block(url, wiki_path=tmp_path)
+
+    assert f"note_id: `{note_id}`" in missing
+    assert "status: `raw_missing`" in missing
+    assert "xhs_extract_note" in missing
+    assert "xhs_ingest_note_to_wiki" in missing
+    assert str(tmp_path / "raw" / "xhs" / "notes" / note_id) in missing
+
+    raw_dir = tmp_path / "raw" / "xhs" / "notes" / note_id
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "note.json").write_text(
+        '{"stats":{"comment_count":0},"comment_threads":{"status":"empty","items":[]}}',
+        encoding="utf-8",
+    )
+    (raw_dir / "note.md").write_text("# note", encoding="utf-8")
+
+    ready = module.xhs_note_context_block(url, wiki_path=tmp_path)
+
+    assert "status: `raw_ready`" in ready
+    assert "Fast path" in ready
+    assert "must not use broad `search_files`" in ready
+
+    (raw_dir / "note.json").write_text(
+        '{"stats":{"comment_count":226},"comment_threads":{"status":"skipped_disabled","items":[]}}',
+        encoding="utf-8",
+    )
+
+    stale = module.xhs_note_context_block(url, wiki_path=tmp_path)
+
+    assert "status: `raw_comments_stale`" in stale
+    assert "comment refresh needed: `True`" in stale
+    assert "Refresh-comments path" in stale
+    assert "extract_comments=true" in stale
+
+
 def test_block_command_keeps_seed_task_safe() -> None:
     module = load_module()
     command = module.block_command("t_example")
 
-    assert command[:3] == ["hermes", "kanban", "block"]
+    assert Path(command[0]).name == "hermes"
+    assert command[1:3] == ["kanban", "block"]
     assert command[3] == "t_example"
     assert "安全种子任务" in command[4]
 
@@ -85,12 +130,14 @@ def test_xhs_worker_instruction_mentions_existing_skills() -> None:
     instruction = module.worker_instruction(
         "xhs-content",
         "lufei-hastings",
-        source="https://www.xiaohongshu.com/explore/example",
+        source="https://www.xiaohongshu.com/explore/69da513a0000000023005dfa",
     )
 
     assert "xhs-viral-analysis" in instruction
     assert "xhs-topic-selection" in instruction
     assert "xhs-script-generation" in instruction
+    assert "69da513a0000000023005dfa" in instruction
+    assert "exact raw dir" in instruction
     assert "为什么会点赞" in instruction
     assert "不能编数字" in instruction
 
@@ -101,7 +148,7 @@ def test_create_swarm_adds_role_comments() -> None:
 
     def fake_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        if command[:3] == ["hermes", "kanban", "swarm"]:
+        if Path(command[0]).name == "hermes" and command[1:3] == ["kanban", "swarm"]:
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -120,9 +167,64 @@ def test_create_swarm_adds_role_comments() -> None:
     )
 
     assert result["comments_added"] == 5
-    assert calls[0][:3] == ["hermes", "kanban", "swarm"]
+    assert Path(calls[0][0]).name == "hermes"
+    assert calls[0][1:3] == ["kanban", "swarm"]
     assert calls[0][-1] == "--json"
     comment_bodies = "\n".join(call[4] for call in calls[1:])
     assert "xhs_extract_note" in comment_bodies
     assert "Sam Altman 质量门" in comment_bodies
     assert "Elon Mask 终局综合" in comment_bodies
+
+
+def test_customer_consultation_routes_to_cs_crm_diagnosis_and_gate() -> None:
+    module = load_module()
+
+    assert module.classify_orchestration_intent("老师，我想咨询作品集辅导多少钱") == "portfolio-review"
+    assert module.classify_orchestration_intent("我有简历和作品集，先帮我判断适合什么服务") == "customer-consultation"
+    assert module.classify_orchestration_intent("老师，我想问一下课程和一对一价格") == "customer-consultation"
+
+    command = module.swarm_command(
+        "customer-consultation",
+        source="老师，我想问一下课程和一对一价格",
+        run_id="case-1",
+    )
+    command_text = module.shell_join(command)
+
+    assert "lufei-member-cs" in command_text
+    assert "lufei-service-diagnosis" in command_text
+    assert "--verifier lufei-altman" in command_text
+
+
+def test_orchestrate_from_input_dry_run_classifies_xhs_link() -> None:
+    module = load_module()
+
+    result = module.orchestrate_from_input(
+        "请拆解 https://www.xiaohongshu.com/explore/example 并生成逐字稿",
+        run_id="dry",
+        dry_run=True,
+    )
+
+    assert result["task_type"] == "xhs-content"
+    assert "swarm_command" in result["result"]
+
+
+def test_sync_profile_skills_links_role_skills(tmp_path, monkeypatch) -> None:
+    module = load_module()
+    hermes_home = tmp_path / ".hermes"
+    skills_path = tmp_path / "xhs-content-pipeline"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    for skill_name in module.LUFEI_SKILL_NAMES:
+        skill_dir = skills_path / "skills" / skill_name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {skill_name}\ndescription: test.\n---\n",
+            encoding="utf-8",
+        )
+
+    result = module.sync_profile_skills(skills_path=skills_path)
+
+    assert result["ok"] is True
+    target = hermes_home / "profiles" / "lufei-ceo" / "skills" / "lufei" / "lufei-ops-orchestrator"
+    assert target.is_symlink()
+    assert (target / "SKILL.md").exists()

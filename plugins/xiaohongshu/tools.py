@@ -31,7 +31,10 @@ XHS_EXTRACT_NOTE_SCHEMA = {
         "Extract one user-submitted Xiaohongshu note URL. Resolves short/long "
         "links, extracts note_id/title/body/images/video metadata, downloads "
         "media into the current Hermes cache by default, optionally OCRs images, "
-        "transcribes video audio by default, and writes note.json plus note.md."
+        "transcribes video audio by default, and writes note.json plus note.md. "
+        "For full 路飞 AI Team / 路飞知识水电站 / Hermes Kanban workflows, do not "
+        "call this tool directly; call lufei_ai_team_orchestrate so the Larry/"
+        "Reed/Jobs/Sam/Elon Kanban cards are created first."
     ),
     "parameters": {
         "type": "object",
