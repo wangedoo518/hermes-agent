@@ -3,8 +3,15 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from plugins.xiaohongshu import register
 from plugins.xiaohongshu import tools as xhs
+
+
+@pytest.fixture(autouse=True)
+def _disable_real_browser_extractor(monkeypatch):
+    monkeypatch.setenv("HERMES_XHS_NOTE_EXTRACTOR", "ssr")
 
 
 def test_extracts_xhs_url_and_note_id_from_share_text():
@@ -106,6 +113,26 @@ def test_extracts_metadata_from_html_with_meta_and_initial_state():
     assert metadata["comment_threads"]["items"][0]["author"]["nickname"] == "Tame light 和光"
     assert metadata["comment_threads"]["items"][0]["like_count"] == 8
     assert metadata["comment_threads"]["items"][0]["replies"][0]["text"] == "适合通勤，也适合小礼服。"
+
+
+def test_extracts_note_body_from_description_when_og_description_is_generic():
+    html = """
+    <html>
+      <head>
+        <meta name="description" content="五一后找工作的人请进～ 面试中有这5个信号的直接被pass。">
+        <meta property="og:description" content="3 亿人的生活经验，都在小红书">
+        <meta property="og:title" content="春招时面试官是怎么淘汰一个人的 - 小红书">
+      </head>
+    </html>
+    """
+
+    metadata = xhs._extract_metadata_from_html(
+        html,
+        base_url="https://www.xiaohongshu.com/explore/69eeef59000000000f03ac00",
+    )
+
+    assert metadata["title"] == "春招时面试官是怎么淘汰一个人的"
+    assert metadata["content"] == "五一后找工作的人请进～ 面试中有这5个信号的直接被pass。"
 
 
 def test_parses_xhs_comment_api_payload():
@@ -458,6 +485,32 @@ Hello, can you hear me?
     assert "我叫路飞" in transcript["text"]
 
 
+def test_chinese_transcripts_are_normalised_to_simplified():
+    text, segments, _ = xhs._parse_srt_text(
+        """1
+00:00:00,000 --> 00:00:01,000
+我做了十三年外企面試，今天聊一點視頻干貨。
+"""
+    )
+    assert "面试" in text
+    assert "视频" in text
+    assert "一點" not in text
+    assert segments[0]["text"] == "我做了十三年外企面试，今天聊一点视频干货。"
+
+    transcript = xhs._normalise_transcript_payload_chinese(
+        {
+            "status": "ok",
+            "language": "zh",
+            "text": "結論先行，數據要講清楚，記得收藏幫助下期見。",
+            "segments": [{"text": "為什麼做、解決了什麼問題。"}],
+        }
+    )
+    assert transcript["script"] == "Hans"
+    assert transcript["normalization"] == "traditional_to_simplified"
+    assert transcript["text"] == "结论先行，数据要讲清楚，记得收藏帮助下期见。"
+    assert transcript["segments"][0]["text"] == "为什么做、解决了什么问题。"
+
+
 def test_write_note_files_creates_json_and_markdown(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -715,8 +768,15 @@ Hello, can you hear me?
     assert result["transcript_provider"] == "xiaohongshu_subtitle"
     assert result["transcript_language"] == "zh"
     assert result["subtitle_count"] == 2
+    assert result["subtitle_language_counts"] == {"en": 1, "zh": 1}
+    assert result["selected_subtitle_index"] == 2
+    assert result["selected_transcript_source"] == "subtitle:2"
     assert payload["audio"]["extract_status"] == "skipped_subtitle_available"
+    assert payload["subtitle_language_counts"] == {"en": 1, "zh": 1}
+    assert payload["subtitles"][0]["selected_for_transcript"] is False
+    assert payload["subtitles"][1]["selected_for_transcript"] is True
     assert "我叫路飞" in payload["transcript"]["text"]
+    assert "- selected_for_transcript: subtitle:2" in Path(result["note_md_path"]).read_text(encoding="utf-8")
 
 
 def test_default_video_note_downloads_and_transcribes_when_possible(tmp_path, monkeypatch):
@@ -798,6 +858,280 @@ def test_default_video_note_downloads_and_transcribes_when_possible(tmp_path, mo
     assert payload["transcript"]["text"] == "先给面试考察点，再给答题框架。"
 
 
+def test_browser_extractor_merges_visible_metadata_comments_and_transcribes_video(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_XHS_ENABLE_BROWSER_EXTRACTOR", "1")
+    note_id = "65b7b9d00000000001001234"
+    html = """
+    <html>
+      <head>
+        <meta property="og:type" content="video.other">
+        <meta property="og:title" content="占位标题 - 小红书">
+        <meta property="og:description" content="3 亿人的生活经验，都在小红书">
+        <meta property="og:image" content="https://sns-img-qc.xhscdn.com/video-cover">
+        <meta property="og:video" content="https://sns-video-qc.xhscdn.com/stream/abc.mp4">
+      </head>
+    </html>
+    """
+
+    async def fake_fetch_page(url):
+        return xhs.PageFetch(
+            original_url=url,
+            final_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+            html_text=html,
+            status_code=200,
+        )
+
+    async def fake_browser_extract(url, note_id_arg, *, extract_comments, max_comments, comment_mode):
+        assert note_id_arg == note_id
+        assert extract_comments is True
+        return (
+            {
+                "status": "ok",
+                "source": "hermes_browser",
+                "metadata_source": "hermes_browser:visible",
+                "title": "vol.13 字节UI/UX设计岗模拟面试（压力面）",
+                "content": "压力面来了，前 15 秒先展示面试考察点，再给答题框架。",
+                "author": {"nickname": "路飞设计沉思录"},
+                "note_type": "video",
+                "stats": {
+                    "status": "ok",
+                    "source": "hermes_browser:visible",
+                    "like_count": 2802,
+                    "collect_count": 314,
+                    "comment_count": 143,
+                    "share_count": 7,
+                },
+                "comment_threads": {
+                    "status": "ok",
+                    "source": "hermes_browser:visible",
+                    "count": 1,
+                    "loaded_count": 1,
+                    "reply_count": 0,
+                    "has_more": None,
+                    "cursor": "",
+                    "items": [
+                        {
+                            "id": "visible_1",
+                            "text": "这就是压力面吗？",
+                            "author": {"nickname": "onom"},
+                            "like_count": 33,
+                            "time": "04-12",
+                            "ip_location": "北京",
+                            "source": "hermes_browser:visible",
+                            "replies": [],
+                        }
+                    ],
+                },
+                "snapshots": [{"role": "initial", "snapshot": "点赞 2802 收藏 314 评论 143"}],
+                "screenshots": [],
+                "vision_payload": {},
+            },
+            [],
+        )
+
+    async def fake_download_image(url, destination, referer):
+        destination.write_bytes(b"\xff\xd8\xff\xe0fake-image")
+
+    async def fake_download_video(url, destination, referer, max_bytes):
+        destination.write_bytes(b"\x00\x00\x00\x18ftypmp42fake-video")
+        return {
+            "local_path": str(destination),
+            "download_status": "ok",
+            "bytes": destination.stat().st_size,
+            "content_type": "video/mp4",
+        }
+
+    async def fake_extract_audio(video_path, audio_path):
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"fake-wav")
+        return {"source": video_path, "local_path": str(audio_path), "extract_status": "ok"}
+
+    def fake_transcribe_audio(file_path, model=None):
+        return {
+            "success": True,
+            "provider": "test",
+            "transcript": "这是中文视频逐字稿。",
+            "segments": [],
+        }
+
+    monkeypatch.setattr(xhs, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr(xhs, "_fetch_note_metadata_from_hermes_browser", fake_browser_extract)
+    monkeypatch.setattr(xhs, "_download_image", fake_download_image)
+    monkeypatch.setattr(xhs, "_download_video", fake_download_video)
+    monkeypatch.setattr(xhs, "_extract_audio_from_video", fake_extract_audio)
+    monkeypatch.setattr("tools.transcription_tools.transcribe_audio", fake_transcribe_audio)
+
+    result = asyncio.run(
+        xhs.extract_xhs_note(
+            f"https://www.xiaohongshu.com/explore/{note_id}",
+            extractor="browser",
+            media_policy="safe_transcribe",
+            ocr=False,
+            extract_comments=True,
+        )
+    )
+
+    assert result["extractor_used"] == "browser"
+    assert result["media_policy"] == "safe_transcribe"
+    assert result["downloaded_video_count"] == 1
+    assert result["transcript_status"] == "ok"
+    payload = json.loads(Path(result["note_json_path"]).read_text(encoding="utf-8"))
+    assert payload["title"] == "vol.13 字节UI/UX设计岗模拟面试（压力面）"
+    assert payload["likes"] == 2802
+    assert payload["comment_threads"]["source"] == "hermes_browser:visible"
+    assert payload["comment_threads"]["items"][0]["text"] == "这就是压力面吗？"
+    assert payload["raw_metadata"]["hermes_browser"]["metadata_source"] == "hermes_browser:visible"
+    assert Path(result["browser_extract_path"]).exists()
+
+
+def test_default_extractor_is_ssr_media_and_does_not_call_browser(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_XHS_NOTE_EXTRACTOR", raising=False)
+    monkeypatch.delenv("HERMES_XHS_ENABLE_BROWSER_EXTRACTOR", raising=False)
+    note_id = "65b7b9d00000000001001234"
+    html = """
+    <html>
+      <head>
+        <meta property="og:title" content="默认走 SSR 媒体 - 小红书">
+        <meta property="og:description" content="默认不打开 Browser。">
+        <meta property="og:image" content="https://sns-img-qc.xhscdn.com/a.jpg">
+      </head>
+    </html>
+    """
+
+    async def fake_fetch_page(url):
+        return xhs.PageFetch(
+            original_url=url,
+            final_url=f"https://www.xiaohongshu.com/explore/{note_id}",
+            html_text=html,
+            status_code=200,
+        )
+
+    async def fail_browser(*args, **kwargs):
+        raise AssertionError("default extraction must not call Hermes Browser")
+
+    async def fake_download_image(url, destination, referer):
+        destination.write_bytes(b"\xff\xd8\xff\xe0fake-image")
+
+    monkeypatch.setattr(xhs, "_fetch_page", fake_fetch_page)
+    monkeypatch.setattr(xhs, "_fetch_note_metadata_from_hermes_browser", fail_browser)
+    monkeypatch.setattr(xhs, "_download_image", fake_download_image)
+
+    result = asyncio.run(
+        xhs.extract_xhs_note(
+            f"https://www.xiaohongshu.com/explore/{note_id}",
+            media_policy="metadata_only",
+            ocr=False,
+        )
+    )
+
+    assert result["extractor_requested"] == "ssr_media"
+    assert result["extractor_used"] == "ssr_media"
+    assert result["browser_extract_status"] == "skipped"
+    payload = json.loads(Path(result["note_json_path"]).read_text(encoding="utf-8"))
+    assert payload["raw_metadata"]["extractor"]["effective"] == "ssr_media"
+    assert "hermes_browser" not in payload["raw_metadata"]
+
+
+def test_browser_note_url_normalises_ios_share_page_to_pc_explore():
+    note = xhs.ParsedNote(
+        note_id="69eb3eb6000000001901e000",
+        source_url="http://xhslink.com/o/3Bb2vbKkLNT",
+        resolved_url=(
+            "https://www.xiaohongshu.com/discovery/item/69eb3eb6000000001901e000"
+            "?app_platform=ios&xsec_source=app_share&type=video&xsec_token=tok-123"
+        ),
+    )
+
+    browser_url = xhs._browser_note_url(note)
+
+    assert browser_url.startswith("https://www.xiaohongshu.com/explore/69eb3eb6000000001901e000?")
+    assert "xsec_token=tok-123" in browser_url
+    assert "xsec_source=pc_user" in browser_url
+    assert "app_platform=ios" not in browser_url
+
+
+def test_browser_extractor_continues_after_navigation_timeout(monkeypatch):
+    monkeypatch.setenv("HERMES_XHS_ENABLE_BROWSER_EXTRACTOR", "1")
+    calls = {"console": 0, "snapshot": 0, "vision": 0}
+
+    def fake_console(clear=False, expression=None, task_id=None):
+        calls["console"] += 1
+        return json.dumps({"success": False, "error": "soft navigation unavailable"})
+
+    def fake_navigate(url, task_id=None):
+        assert "/explore/" in url
+        return json.dumps(
+            {
+                "success": False,
+                "error": "page.goto: Timeout 10000ms exceeded. waiting until load",
+            }
+        )
+
+    def fake_snapshot(full=False, task_id=None, user_task=None):
+        calls["snapshot"] += 1
+        return json.dumps(
+            {
+                "success": True,
+                "snapshot": "标题 有没有offer 3句话就能判断 点赞 7067 收藏 5116 评论 187 分享 1253",
+            },
+            ensure_ascii=False,
+        )
+
+    def fake_vision(question, annotate=False, task_id=None):
+        calls["vision"] += 1
+        return json.dumps(
+            {
+                "success": True,
+                "screenshot_path": "",
+                "analysis": json.dumps(
+                    {
+                        "title": "有没有offer 3句话就能判断",
+                        "content": "先看岗位、作品集和表达。",
+                        "note_type": "video",
+                        "author": {"nickname": "路飞设计沉思录"},
+                        "stats": {
+                            "like_count": 7067,
+                            "collect_count": 5116,
+                            "comment_count": 187,
+                            "share_count": 1253,
+                        },
+                        "comments": [],
+                        "confidence": "medium",
+                        "visible_evidence": "页面可见互动数据",
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    monkeypatch.setattr("tools.browser_tool.browser_console", fake_console)
+    monkeypatch.setattr("tools.browser_tool.browser_navigate", fake_navigate)
+    monkeypatch.setattr("tools.browser_tool.browser_snapshot", fake_snapshot)
+    monkeypatch.setattr("tools.browser_tool.browser_vision", fake_vision)
+
+    payload, warnings = asyncio.run(
+        xhs._fetch_note_metadata_from_hermes_browser(
+            "https://www.xiaohongshu.com/explore/69eb3eb6000000001901e000",
+            "69eb3eb6000000001901e000",
+            extract_comments=False,
+            max_comments=30,
+        )
+    )
+
+    assert calls == {"console": 1, "snapshot": 1, "vision": 1}
+    assert payload["status"] == "ok"
+    assert payload["title"] == "有没有offer 3句话就能判断"
+    assert payload["stats"]["like_count"] == 7067
+    assert any("extraction continued with visible snapshot/vision evidence" in warning for warning in warnings)
+
+
 def test_extract_comments_prefers_browser_cdp_dom_over_api(tmp_path, monkeypatch):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
@@ -854,7 +1188,10 @@ def test_extract_comments_prefers_browser_cdp_dom_over_api(tmp_path, monkeypatch
     result = asyncio.run(
         xhs.extract_xhs_note(
             f"https://www.xiaohongshu.com/explore/{note_id}",
+            extractor="ssr",
             ocr=False,
+            extract_comments=True,
+            allow_legacy_cdp=True,
         )
     )
 
@@ -908,7 +1245,10 @@ def test_extract_comments_does_not_call_api_when_browser_cdp_has_no_comments(tmp
     result = asyncio.run(
         xhs.extract_xhs_note(
             f"https://www.xiaohongshu.com/explore/{note_id}",
+            extractor="ssr",
             ocr=False,
+            extract_comments=True,
+            allow_legacy_cdp=True,
         )
     )
 
@@ -969,8 +1309,10 @@ def test_extract_note_enriches_title_and_body_from_browser_cdp_dom(tmp_path, mon
     result = asyncio.run(
         xhs.extract_xhs_note(
             f"https://www.xiaohongshu.com/explore/{note_id}",
+            extractor="ssr",
             ocr=False,
             extract_comments=False,
+            allow_legacy_cdp=True,
         )
     )
 
@@ -1128,6 +1470,7 @@ def test_fetch_profile_notes_from_browser_cdp_auto_navigates(monkeypatch):
             ],
         }
 
+    monkeypatch.setenv("HERMES_XHS_DANGEROUS_MODE", "1")
     monkeypatch.setattr(xhs, "_cdp_http_base_url", lambda: "http://127.0.0.1:9222")
     monkeypatch.setattr(xhs, "_fetch_cdp_targets", fake_fetch_targets)
     monkeypatch.setattr(xhs, "_open_cdp_target", fake_open_target)
@@ -1327,6 +1670,42 @@ def test_lufei_wiki_init_ingest_manifest_and_query(tmp_path):
     assert "压力面" in query["context"]
 
 
+def test_query_wiki_context_prioritizes_exact_note_id(tmp_path):
+    wiki_path = tmp_path / "lufei-xhs-wiki"
+    raw_dir = wiki_path / "raw" / "xhs" / "notes" / "69da513a0000000023005dfa"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "note.md").write_text(
+        "\n".join(
+            [
+                "---",
+                'title: "vol.13 字节UI/UX设计岗模拟面试（压力面）"',
+                'note_id: "69da513a0000000023005dfa"',
+                "type: raw",
+                "---",
+                "# vol.13 字节UI/UX设计岗模拟面试（压力面）",
+                "",
+                "这是一条指定 note_id 的原始笔记。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    staging_dir = wiki_path / "staging"
+    staging_dir.mkdir(parents=True)
+    (staging_dir / "reed-content-pack.md").write_text(
+        "# Reed Content Pack\n\n" + ("字节 UIUX 压力面 爆款拆解 " * 100),
+        encoding="utf-8",
+    )
+
+    query = xhs.query_wiki_context(
+        query="69da513a0000000023005dfa 字节 UIUX 压力面",
+        wiki_path=str(wiki_path),
+        max_files=3,
+    )
+
+    assert query["matches"]
+    assert query["matches"][0]["path"] == "raw/xhs/notes/69da513a0000000023005dfa/note.md"
+
+
 def test_ingest_account_to_wiki_and_open_in_obsidian(tmp_path, monkeypatch):
     vault_path = tmp_path / "ObsidianVault"
     wiki_path = vault_path / "lufei-xhs-wiki"
@@ -1454,3 +1833,50 @@ def test_plugin_registers_tool():
     assert "xhs_ingest_account_to_wiki" in names
     assert "xhs_query_wiki_context" in names
     assert "xhs_open_wiki_in_obsidian" in names
+
+
+def test_human_pace_clamps_match_xhs_warning_mitigation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_XHS_DANGEROUS_MODE", raising=False)
+
+    assert xhs._clamp_human_pace_comments(1000) == 50
+    assert xhs._clamp_human_pace_notes(49) == 5
+    assert xhs._clamp_human_pace_scroll_rounds(100) == 5
+
+    schema_note = xhs.XHS_EXTRACT_NOTE_SCHEMA["parameters"]["properties"]
+    assert schema_note["extractor"]["default"] == "ssr_media"
+    assert schema_note["extract_comments"]["default"] is False
+    assert schema_note["max_comments"]["maximum"] == 50
+    schema_profile = xhs.XHS_EXTRACT_PROFILE_NOTES_SCHEMA["parameters"]["properties"]
+    assert schema_profile["max_notes"]["maximum"] == 5
+    assert schema_profile["scroll_rounds"]["maximum"] == 5
+
+
+def test_human_pace_session_quota_blocks_after_5_notes(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_XHS_DANGEROUS_MODE", raising=False)
+
+    for i in range(xhs._HUMAN_PACE_MAX_NOTES_PER_SESSION):
+        xhs._human_pace_check("test", note_id=f"note{i}")
+
+    try:
+        xhs._human_pace_check("test", note_id="note_extra")
+    except PermissionError as exc:
+        assert "human-pace guard" in str(exc)
+    else:
+        raise AssertionError("expected PermissionError after quota exhausted")
+
+    # idempotent: re-checking a note already counted in the window is a no-op
+    xhs._human_pace_check("test", note_id="note0")
+
+
+def test_human_pace_dangerous_mode_bypasses_quota(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_XHS_DANGEROUS_MODE", "1")
+
+    # 50 notes through the quota with dangerous mode on must all pass
+    for i in range(50):
+        xhs._human_pace_check("test", note_id=f"note{i}")
+    assert xhs._clamp_human_pace_comments(1000) == 1000
+    assert xhs._clamp_human_pace_notes(49) == 49
+    assert xhs._clamp_human_pace_scroll_rounds(100) == 100

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from datetime import datetime
 from pathlib import Path
@@ -13,8 +14,13 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
-)
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or os.getenv("XHS_WIKI_PATH")
+    or os.getenv("WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
+).expanduser()
 CRM_MANIFEST_PATH = "_derived/lufei-crm-manifest.json"
 
 THEME_ALIASES: dict[str, tuple[str, ...]] = {

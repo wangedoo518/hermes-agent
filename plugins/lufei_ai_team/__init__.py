@@ -2,7 +2,7 @@
 
 This plugin exposes the file-first Lufei AI Team bootstrapper as an actual
 Hermes tool. Without this tool, a normal chat session can read the
-``lufei-ops-orchestrator`` skill and still decide to call low-level tools such
+``creator-ops-orchestrator`` skill and still decide to call low-level tools such
 as ``xhs_extract_note`` directly. The orchestration tool gives the model a
 single deterministic action that creates the Hermes Kanban swarm.
 """

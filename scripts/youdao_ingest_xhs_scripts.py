@@ -13,6 +13,7 @@ import difflib
 import hashlib
 import html
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -24,8 +25,13 @@ import requests
 
 
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
-)
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or os.getenv("XHS_WIKI_PATH")
+    or os.getenv("WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
+).expanduser()
 DEFAULT_SHARE_URL = (
     "https://share.note.youdao.com/ynoteshare/index.html"
     "?id=4c03598369e07c3985859bcaaa8fb1e0&type=notebook&_time=1779523596689"

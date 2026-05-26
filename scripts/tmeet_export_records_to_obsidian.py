@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -23,8 +24,13 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
-)
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or os.getenv("XHS_WIKI_PATH")
+    or os.getenv("WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
+).expanduser()
 DEFAULT_TMEET_REPO = Path("/Users/champion/Documents/develop/tencentmeeting-cli")
 PAGE_SIZE = 30
 

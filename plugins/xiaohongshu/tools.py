@@ -9,6 +9,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -25,13 +26,163 @@ from tools.registry import tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Human-pace guard rails for logged-in CDP access
+# ---------------------------------------------------------------------------
+# Xiaohongshu issued an account warning for "suspected automation" in May 2026
+# after batch profile scrapes (49/49, scroll_rounds=100, max_comments=1000) on a
+# logged-in CDP session. The Tier-2 mitigation in
+# plans/xhs-ingestion-replacement.md keeps CDP available for private data
+# (comments, drafts) but throttles every dimension a risk-control system can
+# fingerprint:
+#   * <= 5 notes per rolling session window (default 1 hour)
+#   * scroll_rounds clamped to <= 5
+#   * max_comments clamped to <= 50
+#   * 15-60 s random jitter between CDP-side operations
+#
+# Set HERMES_XHS_DANGEROUS_MODE=1 to bypass these limits for an explicitly
+# authorised ops run (e.g. one-shot data migration). The bypass is intentionally
+# noisy in the logs so it cannot be left on by accident.
+
+_HUMAN_PACE_MAX_NOTES_PER_SESSION = 5
+_HUMAN_PACE_MAX_COMMENTS = 50
+_HUMAN_PACE_MAX_SCROLL_ROUNDS = 5
+_HUMAN_PACE_SESSION_WINDOW_SECONDS = 60 * 60  # 1 hour rolling
+_HUMAN_PACE_JITTER_MIN_SECONDS = 15.0
+_HUMAN_PACE_JITTER_MAX_SECONDS = 60.0
+
+
+def _xhs_dangerous_mode_enabled() -> bool:
+    return (os.environ.get("HERMES_XHS_DANGEROUS_MODE") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _xhs_browser_extractor_enabled() -> bool:
+    return (os.environ.get("HERMES_XHS_ENABLE_BROWSER_EXTRACTOR") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _human_pace_state_path() -> Path:
+    return _xhs_cache_root() / "_human_pace.json"
+
+
+def _human_pace_load() -> dict[str, Any]:
+    path = _human_pace_state_path()
+    if not path.exists():
+        return {"window_started_at": 0.0, "notes": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"window_started_at": 0.0, "notes": []}
+    if not isinstance(data, dict):
+        return {"window_started_at": 0.0, "notes": []}
+    notes = data.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+    data["notes"] = notes
+    return data
+
+
+def _human_pace_save(state: dict[str, Any]) -> None:
+    path = _human_pace_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - best-effort persistence
+        logger.warning("xhs human-pace state write failed: %s", exc)
+
+
+def _human_pace_active_notes(state: dict[str, Any], *, now: float) -> list[dict[str, Any]]:
+    cutoff = now - _HUMAN_PACE_SESSION_WINDOW_SECONDS
+    return [item for item in state.get("notes", []) if float(item.get("ts", 0)) >= cutoff]
+
+
+def _human_pace_check(action: str, *, note_id: str = "") -> None:
+    """Enforce the rolling N-notes-per-window CDP cap.
+
+    Idempotent on the same ``note_id`` within the window so a single
+    ``extract_xhs_note`` call (which fans out into metadata + comment + retry
+    sub-calls) does not consume multiple slots.
+    """
+
+    if _xhs_dangerous_mode_enabled():
+        logger.warning(
+            "xhs human-pace bypassed by HERMES_XHS_DANGEROUS_MODE=1 (action=%s, note=%s)",
+            action,
+            note_id or "?",
+        )
+        return
+
+    now = time.time()
+    state = _human_pace_load()
+    active = _human_pace_active_notes(state, now=now)
+    if note_id:
+        seen = {str(item.get("note_id", "")) for item in active if item.get("note_id")}
+        if note_id in seen:
+            # Already counted this note inside the window; the same note can be
+            # poked multiple times for metadata + comments + retries.
+            return
+    if len(active) >= _HUMAN_PACE_MAX_NOTES_PER_SESSION:
+        oldest = min((float(item.get("ts", now)) for item in active), default=now)
+        retry_in = max(0, int(_HUMAN_PACE_SESSION_WINDOW_SECONDS - (now - oldest)))
+        raise PermissionError(
+            "Xiaohongshu human-pace guard: reached "
+            f"{_HUMAN_PACE_MAX_NOTES_PER_SESSION} CDP note(s) in the last "
+            f"{_HUMAN_PACE_SESSION_WINDOW_SECONDS // 60} minutes "
+            f"(action={action}). Wait ~{retry_in}s, or set "
+            "HERMES_XHS_DANGEROUS_MODE=1 for an authorised ops run."
+        )
+    active.append({"ts": now, "note_id": note_id, "action": action})
+    state["notes"] = active
+    state["window_started_at"] = state.get("window_started_at") or now
+    _human_pace_save(state)
+
+
+async def _human_pace_jitter(reason: str) -> None:
+    """Sleep a random 15-60 s to mimic human cadence between CDP operations."""
+
+    if _xhs_dangerous_mode_enabled():
+        return
+    delay = random.uniform(_HUMAN_PACE_JITTER_MIN_SECONDS, _HUMAN_PACE_JITTER_MAX_SECONDS)
+    logger.info("xhs human-pace jitter %.1fs before %s", delay, reason)
+    await asyncio.sleep(delay)
+
+
+def _clamp_human_pace_comments(value: int) -> int:
+    if _xhs_dangerous_mode_enabled():
+        return max(0, min(int(value or 0), 1000))
+    return max(0, min(int(value or 0), _HUMAN_PACE_MAX_COMMENTS))
+
+
+def _clamp_human_pace_notes(value: int) -> int:
+    if _xhs_dangerous_mode_enabled():
+        return max(1, min(int(value or 1), 500))
+    return max(1, min(int(value or 1), _HUMAN_PACE_MAX_NOTES_PER_SESSION))
+
+
+def _clamp_human_pace_scroll_rounds(value: int) -> int:
+    if _xhs_dangerous_mode_enabled():
+        return max(0, min(int(value or 0), 100))
+    return max(0, min(int(value or 0), _HUMAN_PACE_MAX_SCROLL_ROUNDS))
+
 XHS_EXTRACT_NOTE_SCHEMA = {
     "name": "xhs_extract_note",
     "description": (
         "Extract one user-submitted Xiaohongshu note URL. Resolves short/long "
-        "links, extracts note_id/title/body/images/video metadata, downloads "
-        "media into the current Hermes cache by default, optionally OCRs images, "
-        "transcribes video audio by default, and writes note.json plus note.md. "
+        "links, extracts note_id/title/body/stats/images/video metadata through "
+        "the SSR/initial-state + media path by default, downloads single-note "
+        "media for transcription, optionally OCRs images, transcribes video audio "
+        "by default, and writes note.json plus note.md. Hermes Browser and legacy "
+        "logged-in CDP are disabled by default and must be explicitly enabled. "
         "For full 路飞 AI Team / 路飞知识水电站 / Hermes Kanban workflows, do not "
         "call this tool directly; call lufei_ai_team_orchestrate so the Larry/"
         "Reed/Jobs/Sam/Elon Kanban cards are created first."
@@ -42,6 +193,29 @@ XHS_EXTRACT_NOTE_SCHEMA = {
             "url": {
                 "type": "string",
                 "description": "A Xiaohongshu/xhslink URL, or share text containing one URL.",
+            },
+            "extractor": {
+                "type": "string",
+                "description": (
+                    "Extraction route. ssr_media is the safe default and uses "
+                    "public SSR/initial-state plus single-note media downloads. "
+                    "browser is an opt-in visible-page enrichment route and only "
+                    "runs when HERMES_XHS_ENABLE_BROWSER_EXTRACTOR=1. legacy/ssr "
+                    "are compatibility aliases for ssr_media."
+                ),
+                "enum": ["ssr_media", "ssr", "browser", "auto", "legacy"],
+                "default": "ssr_media",
+            },
+            "media_policy": {
+                "type": "string",
+                "description": (
+                    "Media policy. safe_transcribe permits single user-submitted "
+                    "note video/subtitle downloads strictly for transcript/STT; "
+                    "metadata_only disables media downloads; legacy preserves the "
+                    "old explicit download_video flag behavior."
+                ),
+                "enum": ["safe_transcribe", "metadata_only", "legacy"],
+                "default": "safe_transcribe",
             },
             "ocr": {
                 "type": "boolean",
@@ -88,16 +262,43 @@ XHS_EXTRACT_NOTE_SCHEMA = {
             "extract_comments": {
                 "type": "boolean",
                 "description": (
-                    "Extract comments from the logged-in Browser/CDP DOM."
+                    "Extract visible comments through opt-in Hermes Browser or "
+                    "legacy CDP. Off by default for safety; in the default "
+                    "ssr_media route comment正文 is unavailable unless the user "
+                    "provides screenshots/text."
                 ),
-                "default": True,
+                "default": False,
+            },
+            "comment_mode": {
+                "type": "string",
+                "description": (
+                    "sample extracts a bounded visible sample; full attempts more "
+                    "browser scroll rounds for authorised single-note analysis but "
+                    "still records whether the capture is complete."
+                ),
+                "enum": ["sample", "full"],
+                "default": "sample",
             },
             "max_comments": {
                 "type": "integer",
-                "description": "Maximum top-level comments to keep in note.json/note.md. Defaults high enough for full extraction on typical notes.",
-                "default": 1000,
+                "description": (
+                    "Maximum top-level comments to keep. Hard-capped at 50 "
+                    "under the human-pace guard; set "
+                    "HERMES_XHS_DANGEROUS_MODE=1 to lift the cap for "
+                    "authorised ops runs."
+                ),
+                "default": 30,
                 "minimum": 0,
-                "maximum": 1000,
+                "maximum": 50,
+            },
+            "allow_legacy_cdp": {
+                "type": "boolean",
+                "description": (
+                    "Explicitly allow the old logged-in Browser/CDP DOM enrichment "
+                    "path. Defaults false because logged-in CDP DOM/API paths are "
+                    "deprecated and risky for Xiaohongshu accounts."
+                ),
+                "default": False,
             },
         },
         "required": ["url"],
@@ -121,17 +322,25 @@ XHS_EXTRACT_PROFILE_NOTES_SCHEMA = {
             },
             "max_notes": {
                 "type": "integer",
-                "description": "Maximum profile notes to keep.",
-                "default": 500,
+                "description": (
+                    "Maximum profile notes to keep. Hard-capped at 5 under "
+                    "the human-pace guard (Xiaohongshu flags 49/49 full "
+                    "scrapes); set HERMES_XHS_DANGEROUS_MODE=1 to lift."
+                ),
+                "default": 3,
                 "minimum": 1,
-                "maximum": 500,
+                "maximum": 5,
             },
             "scroll_rounds": {
                 "type": "integer",
-                "description": "Browser/CDP scroll rounds before using the page app API pagination.",
-                "default": 100,
+                "description": (
+                    "Browser/CDP scroll rounds before using the page app API "
+                    "pagination. Hard-capped at 5 under the human-pace "
+                    "guard; set HERMES_XHS_DANGEROUS_MODE=1 to lift."
+                ),
+                "default": 2,
                 "minimum": 0,
-                "maximum": 100,
+                "maximum": 5,
             },
             "prefer_cdp": {
                 "type": "boolean",
@@ -159,7 +368,7 @@ XHS_INIT_LUFEI_WIKI_SCHEMA = {
         "properties": {
             "wiki_path": {
                 "type": "string",
-                "description": "Wiki root path. Defaults to LUFEI_XHS_WIKI_PATH/XHS_WIKI_PATH/WIKI_PATH or ~/Documents/develop/lufei-xhs-wiki.",
+                "description": "Wiki root path. Defaults to HERMES_XHS_WIKI_PATH/HERMES_CREATOR_WIKI_PATH/LUFEI_XHS_WIKI_PATH/XHS_WIKI_PATH/WIKI_PATH or /Users/champion/Documents/develop/lufei/wiki.",
             },
             "overwrite": {
                 "type": "boolean",
@@ -190,7 +399,7 @@ XHS_INGEST_NOTE_TO_WIKI_SCHEMA = {
             },
             "wiki_path": {
                 "type": "string",
-                "description": "Wiki root path. Defaults to LUFEI_XHS_WIKI_PATH/XHS_WIKI_PATH/WIKI_PATH or ~/Documents/develop/lufei-xhs-wiki.",
+                "description": "Wiki root path. Defaults to HERMES_XHS_WIKI_PATH/HERMES_CREATOR_WIKI_PATH/LUFEI_XHS_WIKI_PATH/XHS_WIKI_PATH/WIKI_PATH or /Users/champion/Documents/develop/lufei/wiki.",
             },
             "account": {
                 "type": "string",
@@ -223,7 +432,7 @@ XHS_INGEST_ACCOUNT_TO_WIKI_SCHEMA = {
             },
             "wiki_path": {
                 "type": "string",
-                "description": "Wiki root path. Defaults to the configured wiki path or the active Obsidian vault/lufei-xhs-wiki.",
+                "description": "Wiki root path. Defaults to the configured wiki path or /Users/champion/Documents/develop/lufei/wiki.",
             },
             "account": {
                 "type": "string",
@@ -312,9 +521,12 @@ XHS_OPEN_WIKI_IN_OBSIDIAN_SCHEMA = {
 XHS_RUN_CONTENT_SKILL_SCHEMA = {
     "name": "xhs_run_content_skill",
     "description": (
-        "Run one local xhs-content-pipeline skill (viral-analysis, topic-selection, "
-        "script-generation, or comment-intelligence) with text input. This bridges "
-        "Hermes extraction/wiki artifacts into the existing content skill pipeline."
+        "Legacy compatibility runner for the old xhs-content-pipeline script "
+        "(viral-analysis, topic-selection, script-generation, or comment-intelligence). "
+        "Do not use this for normal chat analysis. For current Hermes Skill Pack flows, "
+        "load the corresponding SKILL.md with skill_view and answer with the active "
+        "Hermes model instead. Only call this tool when the user explicitly asks to run "
+        "the legacy xhs-content-pipeline script."
     ),
     "parameters": {
         "type": "object",
@@ -337,7 +549,7 @@ XHS_RUN_CONTENT_SKILL_SCHEMA = {
             },
             "pipeline_path": {
                 "type": "string",
-                "description": "Path to xhs-content-pipeline. Defaults to /Users/champion/Documents/develop/skills/xhs-content-pipeline.",
+                "description": "Legacy path to xhs-content-pipeline. Defaults to /Users/champion/Documents/develop/skills/xhs-content-pipeline.",
             },
             "model": {
                 "type": "string",
@@ -597,16 +809,16 @@ def _obsidian_status(wiki_path: Path) -> dict[str, Any]:
 
 def _default_lufei_wiki_path() -> Path:
     configured = (
-        os.environ.get("LUFEI_XHS_WIKI_PATH")
+        os.environ.get("HERMES_XHS_WIKI_PATH")
+        or os.environ.get("HERMES_CREATOR_WIKI_PATH")
+        or os.environ.get("LUFEI_XHS_WIKI_PATH")
         or os.environ.get("XHS_WIKI_PATH")
         or os.environ.get("WIKI_PATH")
     )
     if configured:
         return Path(configured).expanduser()
-    vault_path = _obsidian_active_vault_path()
-    if vault_path:
-        return vault_path / "lufei-xhs-wiki"
-    return Path.home() / "Documents" / "develop" / "lufei-xhs-wiki"
+    candidate = Path("/Users/champion/Documents/develop/lufei/wiki")
+    return candidate
 
 
 def _resolve_wiki_path(value: str | None = None) -> Path:
@@ -1578,7 +1790,7 @@ def _pick_comment_threads(candidates: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _limit_comment_threads(comment_threads: dict[str, Any], max_comments: int) -> dict[str, Any]:
-    max_comments = max(0, min(int(max_comments or 0), 1000))
+    max_comments = _clamp_human_pace_comments(max_comments)
     threads = dict(comment_threads or _comment_empty())
     items = list(threads.get("items") or [])
     threads["items"] = items[:max_comments]
@@ -1810,6 +2022,388 @@ def _merge_note_metadata_from_browser_dom(note: ParsedNote, metadata: dict[str, 
     note.raw_metadata = raw_metadata
 
 
+def _json_dict_from_text(value: str) -> dict[str, Any]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.S | re.I)
+    if fence_match:
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(fence_match.group(1))
+            return parsed if isinstance(parsed, dict) else {}
+    start = text.find("{")
+    if start < 0:
+        return {}
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                with contextlib.suppress(json.JSONDecodeError):
+                    parsed = json.loads(text[start : index + 1])
+                    return parsed if isinstance(parsed, dict) else {}
+                return {}
+    return {}
+
+
+def _browser_tool_json(raw: str) -> dict[str, Any]:
+    parsed = _json_dict_from_text(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _browser_extract_task_id(note_id: str) -> str:
+    safe = re.sub(r"[^a-zA-Z0-9_-]+", "-", note_id or "unknown").strip("-")[:48]
+    return f"xhs-extract-{safe or 'unknown'}"
+
+
+def _browser_note_url(note: ParsedNote, original_url: str = "") -> str:
+    """Return the least surprising PC URL for Hermes Browser extraction.
+
+    Xiaohongshu share links often resolve to ``/discovery/item/<note_id>`` with
+    ``app_platform=ios`` query params. The public HTML/media fallback can parse
+    those, but agent-browser/Playwright waits for full page load and this mobile
+    share surface frequently times out. For Browser extraction we prefer the PC
+    note route while preserving xsec_token when present.
+    """
+
+    note_id = (note.note_id or _extract_note_id_from_url(note.resolved_url) or _extract_note_id_from_url(original_url) or "").strip()
+    if not note_id:
+        return note.resolved_url or original_url
+    token = _extract_xsec_token_from_url(note.resolved_url) or _extract_xsec_token_from_url(original_url)
+    query: dict[str, str] = {}
+    if token:
+        query["xsec_token"] = token
+    query["xsec_source"] = "pc_user"
+    suffix = f"?{urlencode(query)}" if query else ""
+    return f"https://www.xiaohongshu.com/explore/{note_id}{suffix}"
+
+
+def _browser_prompt(note_id: str, *, include_comments: bool) -> str:
+    comment_instruction = (
+        "Also extract visible comments currently on screen. Do not infer hidden comments."
+        if include_comments
+        else "Do not extract comments."
+    )
+    return (
+        "你正在查看一条小红书笔记页面。请只基于当前屏幕可见内容返回严格 JSON，不要输出解释文字。"
+        "字段："
+        "{"
+        '"title": string, "content": string, "note_type": "video|image_text|unknown", '
+        '"author": {"nickname": string}, '
+        '"stats": {"like_count": number|null, "collect_count": number|null, "comment_count": number|null, "share_count": number|null}, '
+        '"comments": [{"id": string, "author": string, "text": string, "like_count": number|null, "time": string, "ip_location": string}], '
+        '"confidence": "high|medium|low", "visible_evidence": string'
+        "}"
+        f"。note_id={note_id}。{comment_instruction}"
+    )
+
+
+def _is_xhs_browser_security_block(snapshot_text: str) -> bool:
+    text = snapshot_text or ""
+    return "300012" in text or ("安全限制" in text and "IP存在风险" in text)
+
+
+def _normalise_browser_stats(payload: dict[str, Any], snapshot_text: str = "") -> dict[str, Any]:
+    stats_payload = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+    candidates: list[dict[str, Any]] = []
+    if stats_payload:
+        candidate = {
+            "status": "missing",
+            "source": "hermes_browser:visible",
+            "like_count": None,
+            "collect_count": None,
+            "comment_count": None,
+            "share_count": None,
+            "liked": None,
+            "collected": None,
+        }
+        for key in ("like_count", "collect_count", "comment_count", "share_count"):
+            candidate[key] = _parse_count(stats_payload.get(key))
+        if any(candidate.get(key) is not None for key in ("like_count", "collect_count", "comment_count", "share_count")):
+            candidate["status"] = "ok"
+            candidates.append(candidate)
+
+    text = "\n".join(
+        part
+        for part in [
+            snapshot_text,
+            str(payload.get("visible_evidence") or ""),
+            json.dumps(payload, ensure_ascii=False) if payload else "",
+        ]
+        if part
+    )
+    label_patterns = {
+        "like_count": r"(?:点赞|赞|喜欢)\s*[:：]?\s*([0-9.,，]+(?:万|千|w|W|k|K)?)",
+        "collect_count": r"(?:收藏|星标)\s*[:：]?\s*([0-9.,，]+(?:万|千|w|W|k|K)?)",
+        "comment_count": r"(?:评论|留言)\s*[:：]?\s*([0-9.,，]+(?:万|千|w|W|k|K)?)",
+        "share_count": r"(?:转发|分享)\s*[:：]?\s*([0-9.,，]+(?:万|千|w|W|k|K)?)",
+    }
+    text_candidate = {
+        "status": "missing",
+        "source": "hermes_browser:snapshot",
+        "like_count": None,
+        "collect_count": None,
+        "comment_count": None,
+        "share_count": None,
+        "liked": None,
+        "collected": None,
+    }
+    for key, pattern in label_patterns.items():
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            text_candidate[key] = _parse_count(match.group(1))
+    if any(text_candidate.get(key) is not None for key in ("like_count", "collect_count", "comment_count", "share_count")):
+        text_candidate["status"] = "ok"
+        candidates.append(text_candidate)
+    return _pick_stats(candidates)
+
+
+def _normalise_browser_comments(payload: dict[str, Any], *, max_comments: int) -> dict[str, Any]:
+    max_comments = _clamp_human_pace_comments(max_comments)
+    raw_comments = payload.get("comments")
+    if not isinstance(raw_comments, list) or max_comments <= 0:
+        return _comment_empty(status="skipped_limit" if max_comments <= 0 else "no_visible_comments", source="hermes_browser:visible")
+    items: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_comments[:max_comments], start=1):
+        if not isinstance(raw, dict):
+            continue
+        text = _clean_text(raw.get("text") or raw.get("content") or "")
+        if not text:
+            continue
+        author_raw = raw.get("author")
+        if isinstance(author_raw, dict):
+            author = {
+                "id": _clean_text(author_raw.get("id") or author_raw.get("user_id") or ""),
+                "nickname": _clean_text(author_raw.get("nickname") or author_raw.get("name") or ""),
+            }
+        else:
+            author = {"id": "", "nickname": _clean_text(author_raw or "")}
+        items.append(
+            {
+                "id": _clean_text(raw.get("id") or f"visible_{index}"),
+                "text": text,
+                "author": author,
+                "like_count": _parse_count(raw.get("like_count") or raw.get("likes")),
+                "time": _clean_text(raw.get("time") or ""),
+                "ip_location": _clean_text(raw.get("ip_location") or ""),
+                "source": "hermes_browser:visible",
+                "replies": [],
+            }
+        )
+    if not items:
+        return _comment_empty(status="no_visible_comments", source="hermes_browser:visible")
+    return {
+        "status": "ok",
+        "source": "hermes_browser:visible",
+        "auth_required": False,
+        "count": len(items),
+        "total_count": None,
+        "loaded_count": len(items),
+        "reply_count": 0,
+        "has_more": None,
+        "cursor": "",
+        "items": items,
+    }
+
+
+async def _fetch_note_metadata_from_hermes_browser(
+    url: str,
+    note_id: str,
+    *,
+    extract_comments: bool,
+    max_comments: int,
+    comment_mode: str = "sample",
+) -> tuple[dict[str, Any], list[str]]:
+    """Extract visible note evidence through Hermes Browser.
+
+    This path intentionally uses browser navigation/snapshot/vision only. It
+    does not inject DOM walker JavaScript and does not call Xiaohongshu internal
+    web APIs. The old Browser/CDP DOM path remains available only behind an
+    explicit allow_legacy_cdp flag.
+    """
+
+    if not url:
+        return ({}, ["Hermes Browser extraction skipped: missing URL."])
+    task_id = _browser_extract_task_id(note_id)
+    warnings: list[str] = []
+    snapshots: list[dict[str, Any]] = []
+    screenshots: list[dict[str, Any]] = []
+    try:
+        from tools.browser_tool import browser_console, browser_navigate, browser_scroll, browser_snapshot, browser_vision
+    except Exception as exc:
+        return ({}, [f"Hermes Browser extraction unavailable: {exc}"])
+
+    try:
+        if "xiaohongshu.com" in urlparse(url).netloc.lower():
+            nav_expr = f"window.location.assign({json.dumps(url, ensure_ascii=False)}); 'navigating'"
+            nav = _browser_tool_json(browser_console(expression=nav_expr, task_id=task_id))
+            if nav and nav.get("success") is False:
+                warnings.append(f"Hermes Browser soft navigation failed: {nav.get('error') or nav}")
+                nav = _browser_tool_json(browser_navigate(url, task_id=task_id))
+                if nav and nav.get("success") is False:
+                    error_text = str(nav.get("error") or "")
+                    if "timeout" not in error_text.lower() and "page.goto" not in error_text.lower():
+                        warnings.append(f"Hermes Browser navigate failed: {nav.get('error') or nav}")
+                        return ({}, warnings)
+                    warnings.append(
+                        "Hermes Browser page load timed out, but extraction continued with visible snapshot/vision evidence."
+                    )
+            else:
+                warnings.append("Hermes Browser used soft navigation for Xiaohongshu to avoid load-event timeout.")
+                await asyncio.sleep(
+                    max(2.0, min(float(os.environ.get("HERMES_XHS_BROWSER_SOFT_NAV_WAIT_SEC", "8")), 20.0))
+                )
+        else:
+            nav = _browser_tool_json(browser_navigate(url, task_id=task_id))
+            if nav and nav.get("success") is False:
+                error_text = str(nav.get("error") or "")
+                if "timeout" not in error_text.lower() and "page.goto" not in error_text.lower():
+                    warnings.append(f"Hermes Browser navigate failed: {nav.get('error') or nav}")
+                    return ({}, warnings)
+                warnings.append(
+                    "Hermes Browser page load timed out, but extraction continued with visible snapshot/vision evidence."
+                )
+        snap = _browser_tool_json(
+            browser_snapshot(
+                full=False,
+                task_id=task_id,
+                user_task="Extract visible Xiaohongshu note title, body, stats, and bounded comment samples.",
+            )
+        )
+        if snap.get("success"):
+            snapshots.append({"role": "initial", "snapshot": snap.get("snapshot") or ""})
+        elif snap:
+            warnings.append(f"Hermes Browser snapshot failed: {snap.get('error') or snap}")
+
+        if extract_comments:
+            rounds = 1 if (comment_mode or "sample") == "sample" else _HUMAN_PACE_MAX_SCROLL_ROUNDS
+            for round_index in range(rounds):
+                scrolled = _browser_tool_json(browser_scroll("down", task_id=task_id))
+                if scrolled and scrolled.get("success") is False:
+                    warnings.append(f"Hermes Browser scroll failed at round {round_index + 1}: {scrolled.get('error') or scrolled}")
+                    break
+                await asyncio.sleep(0.4)
+                snap = _browser_tool_json(
+                    browser_snapshot(
+                        full=False,
+                        task_id=task_id,
+                        user_task="Extract visible Xiaohongshu comments and interaction counts.",
+                    )
+                )
+                if snap.get("success"):
+                    snapshots.append({"role": f"comments_{round_index + 1}", "snapshot": snap.get("snapshot") or ""})
+
+        vision = _browser_tool_json(
+            browser_vision(
+                _browser_prompt(note_id, include_comments=extract_comments),
+                annotate=False,
+                task_id=task_id,
+            )
+        )
+        vision_analysis = vision.get("analysis") if isinstance(vision, dict) else ""
+        if vision.get("screenshot_path"):
+            screenshots.append({"role": "visible_page", "local_path": vision.get("screenshot_path")})
+        structured = _json_dict_from_text(vision_analysis if isinstance(vision_analysis, str) else "")
+        if not structured and vision.get("success") is False:
+            warnings.append(f"Hermes Browser vision failed: {vision.get('error') or vision.get('analysis') or 'unknown error'}")
+
+        snapshot_text = "\n\n".join(str(item.get("snapshot") or "") for item in snapshots)
+        title = _clean_title(structured.get("title") or "")
+        content = _clean_text(structured.get("content") or "")
+        author = structured.get("author") if isinstance(structured.get("author"), dict) else {}
+        author_nickname = _clean_text(author.get("nickname") or author.get("name") or "")
+        stats = _normalise_browser_stats(structured, snapshot_text=snapshot_text)
+        comments = _normalise_browser_comments(structured, max_comments=max_comments) if extract_comments else _comment_empty(status="skipped_disabled", source="hermes_browser:visible")
+        note_type = _clean_text(structured.get("note_type") or "")
+        payload = {
+            "status": "ok" if any([title, content, author_nickname, stats.get("status") == "ok", comments.get("items")]) else "empty",
+            "source": "hermes_browser",
+            "metadata_source": "hermes_browser:visible",
+            "title": title,
+            "content": content,
+            "author": {"nickname": author_nickname} if author_nickname else {},
+            "note_type": note_type if note_type in {"video", "image_text", "unknown"} else "",
+            "stats": stats,
+            "comment_threads": comments,
+            "snapshots": snapshots,
+            "screenshots": screenshots,
+            "vision_payload": structured,
+        }
+        if payload["status"] == "empty":
+            warnings.append("Hermes Browser opened the page but did not extract visible note metadata.")
+        else:
+            warnings.append("Note metadata was extracted through Hermes Browser visible-page evidence.")
+        return (payload, warnings)
+    except Exception as exc:
+        return ({}, [f"Hermes Browser extraction failed: {exc}"])
+
+
+def _merge_note_metadata_from_hermes_browser(note: ParsedNote, metadata: dict[str, Any]) -> None:
+    if not metadata:
+        return
+    title = _clean_title(metadata.get("title") or "")
+    content = _clean_text(metadata.get("content") or "")
+    if title:
+        note.title = title
+    if content and (len(content) > len(note.content or "") or note.content in {"3 亿人的生活经验，都在小红书"}):
+        note.content = content
+    note_type = _clean_text(metadata.get("note_type") or "")
+    if note_type in {"video", "image_text"} and note.note_type == "unknown":
+        note.note_type = note_type
+    author = metadata.get("author") if isinstance(metadata.get("author"), dict) else {}
+    nickname = _clean_text(author.get("nickname") or "")
+    if nickname:
+        note.author = {**(note.author or {}), "nickname": nickname}
+    browser_stats = metadata.get("stats") if isinstance(metadata.get("stats"), dict) else {}
+    if browser_stats.get("status") == "ok":
+        merged_stats = dict(note.stats or _pick_stats([]))
+        for key in ("like_count", "collect_count", "comment_count", "share_count"):
+            if browser_stats.get(key) is not None:
+                merged_stats[key] = browser_stats[key]
+        if any(merged_stats.get(key) is not None for key in ("like_count", "collect_count", "comment_count", "share_count")):
+            merged_stats["status"] = "ok"
+            merged_stats["source"] = browser_stats.get("source") or "hermes_browser:visible"
+        note.stats = merged_stats
+    comment_threads = metadata.get("comment_threads") if isinstance(metadata.get("comment_threads"), dict) else {}
+    if comment_threads.get("items"):
+        note.comment_threads = comment_threads
+    raw_metadata = dict(note.raw_metadata or {})
+    raw_metadata["hermes_browser"] = {
+        "status": metadata.get("status") or "",
+        "metadata_source": metadata.get("metadata_source") or "hermes_browser:visible",
+        "title_chars": len(title),
+        "content_chars": len(content),
+        "author_present": bool(nickname),
+        "snapshot_count": len(metadata.get("snapshots") or []),
+        "screenshot_count": len(metadata.get("screenshots") or []),
+        "comment_status": (metadata.get("comment_threads") or {}).get("status", ""),
+    }
+    raw_metadata["hermes_browser_payload"] = {
+        "snapshots": metadata.get("snapshots") or [],
+        "screenshots": metadata.get("screenshots") or [],
+        "vision_payload": metadata.get("vision_payload") or {},
+    }
+    note.raw_metadata = raw_metadata
+
+
 def _cdp_http_base_url() -> str:
     raw = (
         os.environ.get("HERMES_XHS_BROWSER_CDP_URL")
@@ -1960,7 +2554,7 @@ async def _browser_cdp_runtime_evaluate(
 
 
 def _comment_dom_extractor_js(max_comments: int) -> str:
-    max_comments = max(0, min(int(max_comments or 0), 1000))
+    max_comments = _clamp_human_pace_comments(max_comments)
     return (
         r"""
 (async () => {
@@ -2155,8 +2749,8 @@ _NOTE_DOM_METADATA_JS = r"""
 
 
 def _profile_dom_extractor_js(max_notes: int, scroll_rounds: int) -> str:
-    max_notes = max(1, min(int(max_notes or 500), 500))
-    scroll_rounds = max(0, min(int(scroll_rounds or 100), 100))
+    max_notes = _clamp_human_pace_notes(max_notes)
+    scroll_rounds = _clamp_human_pace_scroll_rounds(scroll_rounds)
     return (
         r"""
 (async () => {
@@ -2483,13 +3077,22 @@ async def _fetch_comment_threads_from_browser_cdp(
     *,
     max_comments: int,
 ) -> tuple[dict[str, Any], list[str]]:
-    max_comments = max(0, min(int(max_comments or 0), 1000))
+    max_comments = _clamp_human_pace_comments(max_comments)
     if max_comments <= 0:
         return (_comment_empty(status="skipped_limit", source="browser_cdp:dom"), [])
 
     cdp_base_url = _cdp_http_base_url()
     if not cdp_base_url:
         return (_comment_empty(status="cdp_unavailable", source="browser_cdp:dom"), [])
+
+    try:
+        _human_pace_check("cdp_comments", note_id=note.note_id or "")
+    except PermissionError as exc:
+        return (
+            _comment_empty(status="blocked_human_pace", source="browser_cdp:dom"),
+            [str(exc)],
+        )
+    await _human_pace_jitter("cdp_comments")
 
     targets = await _fetch_cdp_targets(cdp_base_url)
     note_id = (note.note_id or "").lower()
@@ -2534,6 +3137,15 @@ async def _fetch_profile_notes_from_browser_cdp(
     cdp_base_url = _cdp_http_base_url()
     if not cdp_base_url:
         return ({}, [])
+
+    try:
+        _human_pace_check(
+            "cdp_profile",
+            note_id=_extract_profile_id_from_url(profile_url) or profile_url,
+        )
+    except PermissionError as exc:
+        return ({}, [str(exc)])
+    await _human_pace_jitter("cdp_profile")
 
     warnings: list[str] = []
     targets = await _fetch_cdp_targets(cdp_base_url)
@@ -2958,10 +3570,13 @@ def _extract_metadata_from_html(html_text: str, base_url: str) -> dict[str, Any]
         or json_data.get("title", "")
         or _clean_title(_html_title(html_text))
     )
+    og_description = _clean_text(meta.get("og:description", ""))
+    meta_description = _clean_text(meta.get("description", ""))
     content = (
-        _clean_text(meta.get("og:description", ""))
-        or _clean_text(meta.get("description", ""))
+        (og_description if not _is_generic_xhs_description(og_description) else "")
+        or meta_description
         or json_data.get("content", "")
+        or og_description
     )
     videos = _dedupe_videos(meta_videos + json_data.get("videos", []) + regex_videos)
     subtitles = _dedupe_subtitles(json_data.get("subtitles", []) + regex_subtitles)
@@ -3312,6 +3927,648 @@ def _detect_subtitle_language(text: str) -> str:
     return "en" if latin_chars >= 10 else "unknown"
 
 
+def _subtitle_language_counts(subtitle_records: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for record in subtitle_records:
+        language = str(record.get("language") or "unknown").strip() or "unknown"
+        counts[language] = counts.get(language, 0) + 1
+    return counts
+
+
+def _format_subtitle_language_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return ""
+    return ", ".join(f"{language}={count}" for language, count in sorted(counts.items()))
+
+
+def _selected_subtitle_index(transcript: dict[str, Any]) -> int | None:
+    source = str((transcript or {}).get("source") or "")
+    if not source.startswith("subtitle:"):
+        return None
+    return _parse_optional_int(source.split(":", 1)[1])
+
+
+def _annotate_selected_subtitles(
+    subtitle_records: list[dict[str, Any]],
+    transcript: dict[str, Any],
+) -> list[dict[str, Any]]:
+    selected_index = _selected_subtitle_index(transcript)
+    annotated: list[dict[str, Any]] = []
+    for record in subtitle_records:
+        record_copy = dict(record)
+        record_copy["selected_for_transcript"] = (
+            selected_index is not None and record_copy.get("index") == selected_index
+        )
+        annotated.append(record_copy)
+    return annotated
+
+
+_TRADITIONAL_TO_SIMPLIFIED_PHRASES = (
+    ("為什麼", "为什么"),
+    ("什麼", "什么"),
+    ("面試", "面试"),
+    ("視頻", "视频"),
+    ("乾貨", "干货"),
+    ("結尾", "结尾"),
+    ("相關", "相关"),
+    ("歡迎", "欢迎"),
+    ("數據", "数据"),
+    ("總分總結構", "总分总结构"),
+    ("結論", "结论"),
+    ("正確", "正确"),
+    ("曾經", "曾经"),
+    ("誠實", "诚实"),
+    ("類似", "类似"),
+    ("項目", "项目"),
+    ("檢驗", "检验"),
+    ("瀏覽", "浏览"),
+    ("真實性", "真实性"),
+    ("採訪", "采访"),
+    ("幫助", "帮助"),
+    ("拿著", "拿着"),
+)
+
+_GENERIC_XHS_DESCRIPTIONS = {
+    "3 亿人的生活经验，都在小红书",
+    "小红书 - 你的生活指南",
+}
+
+
+def _is_generic_xhs_description(text: str) -> bool:
+    cleaned = _clean_text(text)
+    return not cleaned or cleaned in _GENERIC_XHS_DESCRIPTIONS
+
+
+_TRADITIONAL_TO_SIMPLIFIED_CHARS = str.maketrans(
+    {
+        "萬": "万",
+        "與": "与",
+        "專": "专",
+        "業": "业",
+        "東": "东",
+        "絲": "丝",
+        "兩": "两",
+        "嚴": "严",
+        "個": "个",
+        "臨": "临",
+        "為": "为",
+        "麼": "么",
+        "義": "义",
+        "烏": "乌",
+        "樂": "乐",
+        "喬": "乔",
+        "習": "习",
+        "鄉": "乡",
+        "書": "书",
+        "買": "买",
+        "亂": "乱",
+        "爭": "争",
+        "於": "于",
+        "雲": "云",
+        "亞": "亚",
+        "產": "产",
+        "畝": "亩",
+        "親": "亲",
+        "億": "亿",
+        "僅": "仅",
+        "從": "从",
+        "侖": "仑",
+        "倉": "仓",
+        "備": "备",
+        "儀": "仪",
+        "們": "们",
+        "價": "价",
+        "眾": "众",
+        "優": "优",
+        "會": "会",
+        "傘": "伞",
+        "偉": "伟",
+        "傳": "传",
+        "傷": "伤",
+        "佈": "布",
+        "倫": "伦",
+        "偽": "伪",
+        "體": "体",
+        "餘": "余",
+        "傭": "佣",
+        "債": "债",
+        "傾": "倾",
+        "償": "偿",
+        "兒": "儿",
+        "兌": "兑",
+        "內": "内",
+        "兩": "两",
+        "冊": "册",
+        "寫": "写",
+        "軍": "军",
+        "農": "农",
+        "準": "准",
+        "凍": "冻",
+        "凱": "凯",
+        "別": "别",
+        "刪": "删",
+        "則": "则",
+        "剛": "刚",
+        "創": "创",
+        "劃": "划",
+        "劇": "剧",
+        "劉": "刘",
+        "劍": "剑",
+        "劑": "剂",
+        "勁": "劲",
+        "動": "动",
+        "務": "务",
+        "勝": "胜",
+        "勞": "劳",
+        "勢": "势",
+        "勻": "匀",
+        "區": "区",
+        "醫": "医",
+        "華": "华",
+        "協": "协",
+        "單": "单",
+        "賣": "卖",
+        "盧": "卢",
+        "衛": "卫",
+        "卻": "却",
+        "廠": "厂",
+        "廳": "厅",
+        "歷": "历",
+        "厲": "厉",
+        "壓": "压",
+        "參": "参",
+        "雙": "双",
+        "發": "发",
+        "變": "变",
+        "敘": "叙",
+        "葉": "叶",
+        "號": "号",
+        "後": "后",
+        "嚇": "吓",
+        "嗎": "吗",
+        "啟": "启",
+        "吳": "吴",
+        "員": "员",
+        "聽": "听",
+        "問": "问",
+        "啞": "哑",
+        "響": "响",
+        "喚": "唤",
+        "喪": "丧",
+        "喫": "吃",
+        "噴": "喷",
+        "團": "团",
+        "園": "园",
+        "圍": "围",
+        "國": "国",
+        "圖": "图",
+        "圓": "圆",
+        "聖": "圣",
+        "場": "场",
+        "壞": "坏",
+        "塊": "块",
+        "堅": "坚",
+        "壇": "坛",
+        "壽": "寿",
+        "夢": "梦",
+        "夠": "够",
+        "頭": "头",
+        "奮": "奋",
+        "獎": "奖",
+        "妝": "妆",
+        "婦": "妇",
+        "媽": "妈",
+        "嫻": "娴",
+        "嬰": "婴",
+        "學": "学",
+        "寧": "宁",
+        "寶": "宝",
+        "實": "实",
+        "審": "审",
+        "寫": "写",
+        "寬": "宽",
+        "導": "导",
+        "將": "将",
+        "專": "专",
+        "尋": "寻",
+        "對": "对",
+        "層": "层",
+        "屬": "属",
+        "歲": "岁",
+        "島": "岛",
+        "峽": "峡",
+        "崗": "岗",
+        "嶺": "岭",
+        "幣": "币",
+        "師": "师",
+        "帶": "带",
+        "幫": "帮",
+        "幹": "干",
+        "庫": "库",
+        "廁": "厕",
+        "廂": "厢",
+        "廣": "广",
+        "廢": "废",
+        "開": "开",
+        "異": "异",
+        "張": "张",
+        "強": "强",
+        "彈": "弹",
+        "彙": "汇",
+        "彎": "弯",
+        "錄": "录",
+        "彥": "彦",
+        "徹": "彻",
+        "徑": "径",
+        "復": "复",
+        "徵": "征",
+        "德": "德",
+        "憶": "忆",
+        "懷": "怀",
+        "態": "态",
+        "慣": "惯",
+        "慶": "庆",
+        "憂": "忧",
+        "懶": "懒",
+        "應": "应",
+        "戲": "戏",
+        "戰": "战",
+        "戶": "户",
+        "拋": "抛",
+        "挾": "挟",
+        "捨": "舍",
+        "掃": "扫",
+        "掄": "抡",
+        "採": "采",
+        "掙": "挣",
+        "掛": "挂",
+        "揀": "拣",
+        "換": "换",
+        "揮": "挥",
+        "損": "损",
+        "搖": "摇",
+        "搶": "抢",
+        "擔": "担",
+        "據": "据",
+        "擠": "挤",
+        "擬": "拟",
+        "擴": "扩",
+        "擺": "摆",
+        "攜": "携",
+        "攝": "摄",
+        "攤": "摊",
+        "敗": "败",
+        "數": "数",
+        "敵": "敌",
+        "斷": "断",
+        "時": "时",
+        "晉": "晋",
+        "暫": "暂",
+        "會": "会",
+        "術": "术",
+        "樸": "朴",
+        "機": "机",
+        "殺": "杀",
+        "雜": "杂",
+        "權": "权",
+        "條": "条",
+        "來": "来",
+        "楊": "杨",
+        "極": "极",
+        "構": "构",
+        "標": "标",
+        "樣": "样",
+        "檔": "档",
+        "檢": "检",
+        "決": "决",
+        "欄": "栏",
+        "歐": "欧",
+        "歡": "欢",
+        "歲": "岁",
+        "歷": "历",
+        "歸": "归",
+        "殘": "残",
+        "毀": "毁",
+        "氣": "气",
+        "漢": "汉",
+        "湯": "汤",
+        "溝": "沟",
+        "滅": "灭",
+        "滯": "滞",
+        "滲": "渗",
+        "滿": "满",
+        "濾": "滤",
+        "瀾": "澜",
+        "灣": "湾",
+        "為": "为",
+        "烴": "烃",
+        "無": "无",
+        "煩": "烦",
+        "熱": "热",
+        "愛": "爱",
+        "爾": "尔",
+        "牆": "墙",
+        "牽": "牵",
+        "獨": "独",
+        "獲": "获",
+        "現": "现",
+        "瑪": "玛",
+        "環": "环",
+        "畫": "画",
+        "當": "当",
+        "疇": "畴",
+        "療": "疗",
+        "監": "监",
+        "盜": "盗",
+        "盤": "盘",
+        "盧": "卢",
+        "眾": "众",
+        "睏": "困",
+        "矚": "瞩",
+        "礎": "础",
+        "禮": "礼",
+        "禪": "禅",
+        "離": "离",
+        "種": "种",
+        "積": "积",
+        "稱": "称",
+        "穩": "稳",
+        "窮": "穷",
+        "競": "竞",
+        "筆": "笔",
+        "節": "节",
+        "範": "范",
+        "簡": "简",
+        "簽": "签",
+        "籤": "签",
+        "類": "类",
+        "糾": "纠",
+        "紀": "纪",
+        "約": "约",
+        "級": "级",
+        "純": "纯",
+        "紗": "纱",
+        "納": "纳",
+        "紙": "纸",
+        "紛": "纷",
+        "素": "素",
+        "細": "细",
+        "終": "终",
+        "組": "组",
+        "結": "结",
+        "絕": "绝",
+        "統": "统",
+        "絲": "丝",
+        "經": "经",
+        "綁": "绑",
+        "綠": "绿",
+        "維": "维",
+        "網": "网",
+        "綜": "综",
+        "緊": "紧",
+        "緒": "绪",
+        "紹": "绍",
+        "線": "线",
+        "練": "练",
+        "縣": "县",
+        "縫": "缝",
+        "總": "总",
+        "績": "绩",
+        "織": "织",
+        "繪": "绘",
+        "續": "续",
+        "纏": "缠",
+        "缺": "缺",
+        "罰": "罚",
+        "罷": "罢",
+        "聰": "聪",
+        "聯": "联",
+        "聲": "声",
+        "職": "职",
+        "聽": "听",
+        "肅": "肃",
+        "腦": "脑",
+        "臉": "脸",
+        "臨": "临",
+        "舉": "举",
+        "與": "与",
+        "艱": "艰",
+        "藝": "艺",
+        "節": "节",
+        "蘇": "苏",
+        "藍": "蓝",
+        "處": "处",
+        "虛": "虚",
+        "號": "号",
+        "螢": "萤",
+        "蟲": "虫",
+        "術": "术",
+        "衛": "卫",
+        "衝": "冲",
+        "裡": "里",
+        "裏": "里",
+        "裝": "装",
+        "製": "制",
+        "複": "复",
+        "見": "见",
+        "規": "规",
+        "視": "视",
+        "覺": "觉",
+        "覽": "览",
+        "觀": "观",
+        "觸": "触",
+        "訂": "订",
+        "計": "计",
+        "訊": "讯",
+        "訓": "训",
+        "記": "记",
+        "註": "注",
+        "許": "许",
+        "論": "论",
+        "設": "设",
+        "訪": "访",
+        "訴": "诉",
+        "診": "诊",
+        "詞": "词",
+        "試": "试",
+        "詩": "诗",
+        "誠": "诚",
+        "話": "话",
+        "該": "该",
+        "詳": "详",
+        "誤": "误",
+        "說": "说",
+        "課": "课",
+        "調": "调",
+        "談": "谈",
+        "請": "请",
+        "諮": "咨",
+        "諾": "诺",
+        "謀": "谋",
+        "謂": "谓",
+        "講": "讲",
+        "謝": "谢",
+        "識": "识",
+        "證": "证",
+        "譯": "译",
+        "議": "议",
+        "護": "护",
+        "變": "变",
+        "讓": "让",
+        "這": "这",
+        "豐": "丰",
+        "豔": "艳",
+        "貝": "贝",
+        "負": "负",
+        "財": "财",
+        "責": "责",
+        "賢": "贤",
+        "敗": "败",
+        "貨": "货",
+        "質": "质",
+        "賬": "账",
+        "費": "费",
+        "資": "资",
+        "賽": "赛",
+        "贊": "赞",
+        "趕": "赶",
+        "趨": "趋",
+        "踐": "践",
+        "蹤": "踪",
+        "車": "车",
+        "軟": "软",
+        "輪": "轮",
+        "輯": "辑",
+        "輸": "输",
+        "轉": "转",
+        "辦": "办",
+        "辭": "辞",
+        "邊": "边",
+        "過": "过",
+        "達": "达",
+        "遷": "迁",
+        "選": "选",
+        "遲": "迟",
+        "適": "适",
+        "遺": "遗",
+        "還": "还",
+        "邁": "迈",
+        "鄭": "郑",
+        "郵": "邮",
+        "鄰": "邻",
+        "醫": "医",
+        "醜": "丑",
+        "釋": "释",
+        "針": "针",
+        "鈕": "钮",
+        "鈣": "钙",
+        "鈴": "铃",
+        "鉆": "钻",
+        "銀": "银",
+        "銷": "销",
+        "錯": "错",
+        "錄": "录",
+        "錢": "钱",
+        "錦": "锦",
+        "鐘": "钟",
+        "鍊": "链",
+        "鍵": "键",
+        "鎖": "锁",
+        "鎮": "镇",
+        "鏡": "镜",
+        "長": "长",
+        "門": "门",
+        "閉": "闭",
+        "開": "开",
+        "間": "间",
+        "關": "关",
+        "隊": "队",
+        "陽": "阳",
+        "階": "阶",
+        "險": "险",
+        "隨": "随",
+        "隱": "隐",
+        "難": "难",
+        "電": "电",
+        "靈": "灵",
+        "靜": "静",
+        "頂": "顶",
+        "頁": "页",
+        "項": "项",
+        "順": "顺",
+        "須": "须",
+        "頓": "顿",
+        "預": "预",
+        "領": "领",
+        "頭": "头",
+        "頻": "频",
+        "題": "题",
+        "顏": "颜",
+        "類": "类",
+        "顯": "显",
+        "風": "风",
+        "飛": "飞",
+        "飯": "饭",
+        "飾": "饰",
+        "餓": "饿",
+        "館": "馆",
+        "馬": "马",
+        "駛": "驶",
+        "驗": "验",
+        "體": "体",
+        "髮": "发",
+        "鬥": "斗",
+        "魚": "鱼",
+        "鳥": "鸟",
+        "麗": "丽",
+        "麥": "麦",
+        "麼": "么",
+        "黃": "黄",
+        "幾": "几",
+        "沒": "没",
+        "淚": "泪",
+        "點": "点",
+        "齊": "齐",
+        "龍": "龙",
+    }
+)
+
+
+def _to_simplified_chinese_text(text: str) -> str:
+    if not text:
+        return text
+    for source, target in _TRADITIONAL_TO_SIMPLIFIED_PHRASES:
+        text = text.replace(source, target)
+    return text.translate(_TRADITIONAL_TO_SIMPLIFIED_CHARS)
+
+
+def _normalise_transcript_payload_chinese(transcript: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(transcript, dict):
+        return transcript
+    language = str(transcript.get("language") or "").lower()
+    text = str(transcript.get("text") or "")
+    if not text or not (language.startswith("zh") or _cjk_char_count(text) >= 5):
+        return transcript
+    normalised = dict(transcript)
+    normalised["text"] = _to_simplified_chinese_text(text)
+    segments: list[Any] = []
+    changed_segments = False
+    for segment in transcript.get("segments") or []:
+        if isinstance(segment, dict):
+            segment_copy = dict(segment)
+            if segment_copy.get("text"):
+                segment_copy["text"] = _to_simplified_chinese_text(str(segment_copy.get("text") or ""))
+                changed_segments = True
+            segments.append(segment_copy)
+        else:
+            segments.append(segment)
+    if changed_segments:
+        normalised["segments"] = segments
+    normalised["script"] = "Hans"
+    normalised["normalization"] = "traditional_to_simplified"
+    return normalised
+
+
 def _parse_srt_text(raw_text: str) -> tuple[str, list[dict[str, Any]], int | None]:
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
@@ -3329,7 +4586,7 @@ def _parse_srt_text(raw_text: str) -> tuple[str, list[dict[str, Any]], int | Non
         start_raw, end_raw = [part.strip().split()[0] for part in lines[timing_line_index].split("-->", 1)]
         start_ms = _parse_srt_timestamp_ms(start_raw)
         end_ms = _parse_srt_timestamp_ms(end_raw)
-        segment_text = " ".join(lines[timing_line_index + 1 :]).strip()
+        segment_text = _to_simplified_chinese_text(" ".join(lines[timing_line_index + 1 :]).strip())
         if not segment_text:
             continue
         segments.append(
@@ -3438,7 +4695,7 @@ def _transcript_from_subtitles(
         reverse=True,
     )
     selected = candidates[0]
-    return {
+    return _normalise_transcript_payload_chinese({
         "status": "ok",
         "provider": "xiaohongshu_subtitle",
         "model": "",
@@ -3447,7 +4704,7 @@ def _transcript_from_subtitles(
         "text": selected.get("text", ""),
         "segments": selected.get("segments") or [],
         "end_ms": selected.get("end_ms"),
-    }
+    })
 
 
 def _annotate_transcript_coverage(transcript: dict[str, Any], video_records: list[dict[str, Any]]) -> None:
@@ -3589,6 +4846,7 @@ async def _transcribe_video_audio(
                 "segments": result.get("segments") or [],
             }
         )
+        transcript = _normalise_transcript_payload_chinese(transcript)
     else:
         transcript["status"] = "failed"
         warnings.append(f"Video transcription failed: {result.get('error') or 'unknown STT error'}")
@@ -3697,6 +4955,8 @@ def _write_note_files(
         "segments": [],
         "end_ms": None,
     }
+    subtitle_records = _annotate_selected_subtitles(subtitle_records, transcript)
+    subtitle_language_counts = _subtitle_language_counts(subtitle_records)
     payload = {
         "platform": "xiaohongshu",
         "note_id": note.note_id,
@@ -3715,6 +4975,7 @@ def _write_note_files(
         "images": image_records,
         "videos": video_records,
         "subtitles": subtitle_records,
+        "subtitle_language_counts": subtitle_language_counts,
         "audio": audio_record,
         "transcript": transcript,
         "raw_metadata": note.raw_metadata,
@@ -3844,6 +5105,17 @@ def _render_note_markdown(payload: dict[str, Any]) -> str:
     if not subtitles:
         lines.append("_No subtitles extracted._")
         lines.append("")
+    else:
+        selected_subtitle_index = _selected_subtitle_index(payload.get("transcript") or {})
+        language_counts = payload.get("subtitle_language_counts") or _subtitle_language_counts(subtitles)
+        lines.extend(
+            [
+                f"- total: {len(subtitles)}",
+                f"- language_counts: {_format_subtitle_language_counts(language_counts)}",
+                f"- selected_for_transcript: {f'subtitle:{selected_subtitle_index}' if selected_subtitle_index else ''}",
+                "",
+            ]
+        )
     for subtitle in subtitles:
         lines.extend(
             [
@@ -3853,6 +5125,7 @@ def _render_note_markdown(payload: dict[str, Any]) -> str:
                 f"- local_path: {subtitle.get('local_path', '')}",
                 f"- download_status: {subtitle.get('download_status', '')}",
                 f"- language: {subtitle.get('language', '')}",
+                f"- selected_for_transcript: {str(bool(subtitle.get('selected_for_transcript'))).lower()}",
                 f"- char_count: {subtitle.get('char_count') or 0}",
                 f"- end_ms: {subtitle.get('end_ms') or ''}",
                 "",
@@ -4736,6 +6009,7 @@ def _query_wiki_context(
     terms = [item for item in re.split(r"[\s,，/|]+", query) if item]
     if not terms:
         terms = [query]
+    query_note_ids = {item.lower() for item in re.findall(r"\b[a-f0-9]{24}\b", query.lower())}
     candidates: list[tuple[int, Path, str, dict[str, Any]]] = []
     for path in sorted(wiki_path.rglob("*.md")):
         rel = _normalise_wiki_relative(path, wiki_path)
@@ -4743,12 +6017,23 @@ def _query_wiki_context(
             continue
         text = path.read_text(encoding="utf-8")
         meta = _parse_frontmatter(text)
-        haystack = f"{rel}\n{meta.get('title', '')}\n{text}".lower()
+        title = str(meta.get("title", ""))
+        haystack = f"{rel}\n{title}\n{text}".lower()
         score = 0
         for term in terms:
             term_l = term.lower()
             if term_l in haystack:
-                score += haystack.count(term_l) * (5 if term_l in str(meta.get("title", "")).lower() else 1)
+                score += haystack.count(term_l) * (5 if term_l in title.lower() else 1)
+        if query_note_ids:
+            rel_l = rel.lower()
+            meta_note_id = str(meta.get("note_id") or meta.get("noteId") or "").lower()
+            for note_id in query_note_ids:
+                if meta_note_id == note_id:
+                    score += 150000
+                if note_id in rel_l:
+                    score += 100000
+                elif note_id in haystack:
+                    score += 10000
         if score:
             candidates.append((score, path, text, meta))
     candidates.sort(key=lambda item: item[0], reverse=True)
@@ -4786,6 +6071,8 @@ def _query_wiki_context(
 async def extract_xhs_note(
     url_or_text: str,
     *,
+    extractor: str | None = None,
+    media_policy: str | None = None,
     ocr: bool = True,
     max_images: int = 9,
     vision_model: str | None = None,
@@ -4794,39 +6081,121 @@ async def extract_xhs_note(
     stt_model: str | None = None,
     stt_language: str | None = _DEFAULT_XHS_STT_LANGUAGE,
     max_video_mb: int = _MAX_VIDEO_MB_DEFAULT,
-    extract_comments: bool = True,
-    max_comments: int = 1000,
+    extract_comments: bool = False,
+    max_comments: int = 30,
+    comment_mode: str = "sample",
+    allow_legacy_cdp: bool = False,
 ) -> dict[str, Any]:
     url = _extract_xhs_url(url_or_text)
     if not url:
         raise ValueError("No supported Xiaohongshu/xhslink URL found in input.")
+    extractor_requested = (extractor or os.environ.get("HERMES_XHS_NOTE_EXTRACTOR") or "ssr_media").strip().lower()
+    if extractor_requested not in {"ssr_media", "ssr", "browser", "auto", "legacy"}:
+        raise ValueError("extractor must be one of: ssr_media, ssr, browser, auto, legacy")
+    effective_extractor = "ssr_media" if extractor_requested in {"ssr_media", "ssr", "legacy"} else extractor_requested
+    browser_opt_in = _xhs_browser_extractor_enabled()
+    media_policy = (media_policy or os.environ.get("HERMES_XHS_MEDIA_POLICY") or "safe_transcribe").strip().lower()
+    if media_policy not in {"safe_transcribe", "metadata_only", "legacy"}:
+        raise ValueError("media_policy must be one of: safe_transcribe, metadata_only, legacy")
+    comment_mode = (comment_mode or "sample").strip().lower()
+    if comment_mode not in {"sample", "full"}:
+        raise ValueError("comment_mode must be one of: sample, full")
     max_images = max(1, min(int(max_images or 9), 18))
     max_video_mb = max(1, min(int(max_video_mb or _MAX_VIDEO_MB_DEFAULT), 500))
-    max_comments = max(0, min(int(max_comments or 0), 1000))
+    max_comments = _clamp_human_pace_comments(max_comments)
+    if media_policy == "metadata_only":
+        download_video = False
+        transcribe = False
     fetch = await _fetch_page(url)
     note = _parse_note(fetch)
-    browser_metadata, browser_metadata_warnings = await _fetch_note_metadata_from_browser_cdp(note)
-    if browser_metadata:
-        _merge_note_metadata_from_browser_dom(note, browser_metadata)
-        note.warnings.extend(browser_metadata_warnings)
+    browser_metadata: dict[str, Any] = {}
+    browser_metadata_warnings: list[str] = []
+    extractor_used = "ssr_media"
+    browser_extract_status = "skipped"
+    browser_extract_path = ""
+    if effective_extractor == "auto":
+        effective_extractor = "ssr_media"
+        browser_extract_status = "disabled"
+        note.warnings.append(
+            "extractor=auto resolves to the SSR/media primary extractor for Xiaohongshu. "
+            "Set HERMES_XHS_ENABLE_BROWSER_EXTRACTOR=1 and extractor=browser to opt into Browser enrichment."
+        )
+    if effective_extractor == "browser" and not browser_opt_in:
+        effective_extractor = "ssr_media"
+        browser_extract_status = "disabled"
+        note.warnings.append(
+            "Requested Hermes Browser extractor, but HERMES_XHS_ENABLE_BROWSER_EXTRACTOR is not enabled; "
+            "using SSR/media primary extractor."
+        )
+    if effective_extractor == "browser":
+        browser_metadata, browser_metadata_warnings = await _fetch_note_metadata_from_hermes_browser(
+            _browser_note_url(note, original_url=url),
+            note.note_id,
+            extract_comments=extract_comments,
+            max_comments=max_comments,
+            comment_mode=comment_mode,
+        )
+        browser_extract_status = browser_metadata.get("status") or ("failed" if browser_metadata_warnings else "empty")
+        if browser_metadata:
+            _merge_note_metadata_from_hermes_browser(note, browser_metadata)
+            note.warnings.extend(browser_metadata_warnings)
+            if browser_metadata.get("status") == "ok":
+                extractor_used = "browser"
+        else:
+            note.warnings.extend(browser_metadata_warnings)
+
+    if allow_legacy_cdp:
+        legacy_metadata, legacy_metadata_warnings = await _fetch_note_metadata_from_browser_cdp(note)
+        if legacy_metadata:
+            _merge_note_metadata_from_browser_dom(note, legacy_metadata)
+            note.warnings.extend(legacy_metadata_warnings)
+            extractor_used = "legacy_cdp"
     if extract_comments:
         note.comment_threads = _limit_comment_threads(note.comment_threads, max_comments)
-        cdp_comment_threads, cdp_comment_warnings = await _fetch_comment_threads_from_browser_cdp(
-            note,
-            max_comments=max_comments,
-        )
-        if cdp_comment_threads.get("items"):
+        if note.comment_threads.get("items"):
+            note.comment_threads = _limit_comment_threads(note.comment_threads, max_comments)
+        elif allow_legacy_cdp:
+            cdp_comment_threads, cdp_comment_warnings = await _fetch_comment_threads_from_browser_cdp(
+                note,
+                max_comments=max_comments,
+            )
             note.comment_threads = _limit_comment_threads(cdp_comment_threads, max_comments)
             note.warnings.extend(cdp_comment_warnings)
-        elif _comment_threads_need_api(note.comment_threads, note.stats):
-            note.comment_threads = _limit_comment_threads(cdp_comment_threads, max_comments)
-            note.warnings.append(
-                "Comment extraction requires a logged-in Browser/CDP page; API cookie fallback is disabled."
-            )
+        else:
+            note.comment_threads = _comment_empty(status="unavailable_without_browser", source="ssr_media")
+            if effective_extractor == "browser":
+                note.warnings.append(
+                    "Comment extraction did not find visible comments through Hermes Browser; legacy CDP/API fallback is disabled."
+                )
+            else:
+                note.warnings.append(
+                    "Comment正文 is unavailable in the default SSR/media route. Provide comment screenshots/text, "
+                    "or explicitly enable Hermes Browser/legacy CDP for a bounded authorised single-note run."
+                )
     else:
         note.comment_threads = _comment_empty(status="skipped_disabled")
+    raw_metadata = dict(note.raw_metadata or {})
+    raw_metadata["extractor"] = {
+        "requested": extractor_requested,
+        "effective": effective_extractor,
+        "used": extractor_used,
+        "browser_default_enabled": False,
+        "browser_opt_in_enabled": browser_opt_in,
+        "browser_status": browser_extract_status,
+        "media_policy": media_policy,
+        "comment_policy": "disabled" if not extract_comments else note.comment_threads.get("status", ""),
+    }
+    note.raw_metadata = raw_metadata
     note_dir = _xhs_cache_root() / _safe_note_id(note.note_id)
     note_dir.mkdir(parents=True, exist_ok=True)
+    if browser_metadata:
+        browser_dir = note_dir / "browser"
+        browser_dir.mkdir(parents=True, exist_ok=True)
+        browser_extract_path = str(browser_dir / "browser_extract.json")
+        Path(browser_extract_path).write_text(
+            json.dumps(browser_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     image_records, download_warnings = await _download_note_images(note, note_dir, max_images=max_images)
     warnings = list(note.warnings) + download_warnings
     video_records, video_warnings = await _download_note_videos(
@@ -4836,7 +6205,10 @@ async def extract_xhs_note(
         max_video_mb=max_video_mb,
     )
     warnings.extend(video_warnings)
-    subtitle_records, subtitle_warnings = await _download_note_subtitles(note, note_dir)
+    if media_policy == "metadata_only":
+        subtitle_records, subtitle_warnings = [], []
+    else:
+        subtitle_records, subtitle_warnings = await _download_note_subtitles(note, note_dir)
     warnings.extend(subtitle_warnings)
     if note.note_type == "video":
         subtitle_transcript = _transcript_from_subtitles(
@@ -4895,17 +6267,26 @@ async def extract_xhs_note(
     downloaded_video_count = sum(1 for item in videos if item.get("download_status") == "ok")
     transcript_status = transcript_payload.get("status", "")
     subtitle_count = len(payload.get("subtitles") or [])
+    subtitle_language_counts = payload.get("subtitle_language_counts") or _subtitle_language_counts(payload.get("subtitles") or [])
+    selected_subtitle_index = _selected_subtitle_index(transcript_payload)
     media_summary = (
         f"{payload['note_type']} note; "
         f"{len(images)} image(s); "
         f"{downloaded_video_count}/{len(videos)} video(s) downloaded; "
         f"{subtitle_count} subtitle(s); "
+        f"subtitle_languages={_format_subtitle_language_counts(subtitle_language_counts)}; "
+        f"selected_subtitle={f'subtitle:{selected_subtitle_index}' if selected_subtitle_index else ''}; "
         f"transcript={transcript_status} ({len(transcript_text)} chars)"
     )
     return {
         "success": True,
         "note_id": payload["note_id"],
         "note_type": payload["note_type"],
+        "extractor_requested": extractor_requested,
+        "extractor_used": extractor_used,
+        "media_policy": media_policy,
+        "browser_extract_status": browser_extract_status,
+        "browser_extract_path": browser_extract_path,
         "title": payload["title"],
         "content_chars": len(payload.get("content") or ""),
         "stats": stats_payload,
@@ -4922,6 +6303,9 @@ async def extract_xhs_note(
         "video_count": len(videos),
         "downloaded_video_count": downloaded_video_count,
         "subtitle_count": subtitle_count,
+        "subtitle_language_counts": subtitle_language_counts,
+        "selected_subtitle_index": selected_subtitle_index,
+        "selected_transcript_source": transcript_payload.get("source", ""),
         "video_paths": [item.get("local_path") for item in videos if item.get("download_status") == "ok" and item.get("local_path")],
         "audio_path": (payload.get("audio") or {}).get("local_path", ""),
         "transcript_status": transcript_status,
@@ -4945,16 +6329,16 @@ async def extract_xhs_note(
 async def extract_xhs_profile_notes(
     url_or_text: str,
     *,
-    max_notes: int = 500,
-    scroll_rounds: int = 100,
+    max_notes: int = 3,
+    scroll_rounds: int = 2,
     prefer_cdp: bool = True,
     cdp_auto_navigate: bool = True,
 ) -> dict[str, Any]:
     url = _extract_xhs_url(url_or_text)
     if not url or not _is_xhs_profile_url(url):
         raise ValueError("No supported Xiaohongshu profile URL found in input.")
-    max_notes = max(1, min(int(max_notes or 500), 500))
-    scroll_rounds = max(0, min(int(scroll_rounds or 100), 100))
+    max_notes = _clamp_human_pace_notes(max_notes)
+    scroll_rounds = _clamp_human_pace_scroll_rounds(scroll_rounds)
 
     warnings: list[str] = []
     fetch = await _fetch_page(url)
@@ -5149,6 +6533,8 @@ async def xhs_extract_note_handler(args: dict[str, Any], **_: Any) -> str:
     try:
         result = await extract_xhs_note(
             args.get("url", ""),
+            extractor=args.get("extractor") or None,
+            media_policy=args.get("media_policy") or None,
             ocr=_bool_arg(args, "ocr", True),
             max_images=int(args.get("max_images") or 9),
             vision_model=args.get("vision_model") or None,
@@ -5157,8 +6543,10 @@ async def xhs_extract_note_handler(args: dict[str, Any], **_: Any) -> str:
             stt_model=args.get("stt_model") or None,
             stt_language=args.get("stt_language") or _DEFAULT_XHS_STT_LANGUAGE,
             max_video_mb=int(args.get("max_video_mb") or _MAX_VIDEO_MB_DEFAULT),
-            extract_comments=_bool_arg(args, "extract_comments", True),
-            max_comments=int(args.get("max_comments") or 1000),
+            extract_comments=_bool_arg(args, "extract_comments", False),
+            max_comments=int(args.get("max_comments") or 30),
+            comment_mode=args.get("comment_mode") or "sample",
+            allow_legacy_cdp=_bool_arg(args, "allow_legacy_cdp", False),
         )
         return tool_result(result)
     except Exception as exc:
@@ -5170,8 +6558,8 @@ async def xhs_extract_profile_notes_handler(args: dict[str, Any], **_: Any) -> s
     try:
         result = await extract_xhs_profile_notes(
             args.get("url", ""),
-            max_notes=int(args.get("max_notes") or 500),
-            scroll_rounds=int(args.get("scroll_rounds") or 100),
+            max_notes=int(args.get("max_notes") or 3),
+            scroll_rounds=int(args.get("scroll_rounds") or 2),
             prefer_cdp=_bool_arg(args, "prefer_cdp", True),
             cdp_auto_navigate=_bool_arg(args, "cdp_auto_navigate", True),
         )

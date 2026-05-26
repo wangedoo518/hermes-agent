@@ -42,7 +42,7 @@ def test_render_soul_contains_lufei_operating_boundaries() -> None:
     assert "Chairman: 路飞本人" in soul
     assert "不自动发布小红书" in soul
     assert "Kanban" in soul
-    assert "lufei-ops-orchestrator" in soul
+    assert "creator-ops-orchestrator" in soul
 
 
 def test_xhs_content_swarm_routes_existing_pipeline() -> None:
@@ -58,8 +58,8 @@ def test_xhs_content_swarm_routes_existing_pipeline() -> None:
     assert command[1:3] == ["kanban", "swarm"]
     assert any(part.startswith("lufei-page:") for part in command)
     assert any(part.startswith("lufei-hastings:") for part in command)
-    assert "lufei-data-intake" in command_text
-    assert "lufei-content-studio" in command_text
+    assert "creator-data-intake" in command_text
+    assert "creator-content-studio" in command_text
     assert "--verifier lufei-altman" in command_text
     assert "--synthesizer lufei-ceo" in command_text
     assert "run:retry-1" in command_text
@@ -190,8 +190,8 @@ def test_customer_consultation_routes_to_cs_crm_diagnosis_and_gate() -> None:
     )
     command_text = module.shell_join(command)
 
-    assert "lufei-member-cs" in command_text
-    assert "lufei-service-diagnosis" in command_text
+    assert "creator-member-cs" in command_text
+    assert "creator-service-diagnosis" in command_text
     assert "--verifier lufei-altman" in command_text
 
 
@@ -225,6 +225,6 @@ def test_sync_profile_skills_links_role_skills(tmp_path, monkeypatch) -> None:
     result = module.sync_profile_skills(skills_path=skills_path)
 
     assert result["ok"] is True
-    target = hermes_home / "profiles" / "lufei-ceo" / "skills" / "lufei" / "lufei-ops-orchestrator"
+    target = hermes_home / "profiles" / "lufei-ceo" / "skills" / "lufei" / "creator-ops-orchestrator"
     assert target.is_symlink()
     assert (target / "SKILL.md").exists()

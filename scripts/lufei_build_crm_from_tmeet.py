@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -22,8 +23,13 @@ from zoneinfo import ZoneInfo
 
 
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
-)
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or os.getenv("XHS_WIKI_PATH")
+    or os.getenv("WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
+).expanduser()
 LATEST_DETAIL_POINTER = "_derived/tencent-meetings-cdp-details-latest.json"
 GENERATOR = "lufei_build_crm_from_tmeet.py"
 

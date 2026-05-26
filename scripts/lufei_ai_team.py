@@ -7,7 +7,7 @@ The script keeps the implementation intentionally file-first:
   descriptions so the Kanban decomposer can route work.
 * Kanban is the only orchestration entrypoint. This script can render safe
   commands and, when explicitly requested, create a blocked seed task.
-* The lufei-xhs-wiki remains the long-term source of truth for assets,
+* The Lufei creator wiki remains the long-term source of truth for assets,
   concepts, CRM summaries, and content outputs.
 """
 
@@ -25,9 +25,14 @@ from typing import Any, Callable, Iterable
 
 
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
 )
-DEFAULT_SKILLS_PATH = Path("/Users/champion/Documents/develop/skills/xhs-content-pipeline")
+DEFAULT_SKILLS_PATH = Path(
+    os.getenv("HERMES_SKILLS_PATH") or "/Users/champion/Documents/develop/hermes-skills"
+)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -79,7 +84,7 @@ ROLES: tuple[Role, ...] = (
             "change Lufei persona without Chairman approval",
             "expose private CRM fields to external customer channels",
         ),
-        skills=("lufei-ops-orchestrator", "lufei-quality-gate"),
+        skills=("creator-ops-orchestrator", "creator-quality-gate"),
     ),
     Role(
         profile="lufei-jobs",
@@ -98,7 +103,7 @@ ROLES: tuple[Role, ...] = (
             "price or launch paid SKUs in phase one",
             "replace Lufei's final professional judgment",
         ),
-        skills=("lufei-service-diagnosis", "lufei-quality-gate"),
+        skills=("creator-service-diagnosis", "creator-quality-gate"),
     ),
     Role(
         profile="lufei-page",
@@ -117,7 +122,7 @@ ROLES: tuple[Role, ...] = (
             "perform batch engagement, commenting, or publishing",
             "treat uncited material as verified knowledge",
         ),
-        skills=("lufei-data-intake", "lufei-system-integration"),
+        skills=("creator-data-intake", "creator-system-integration"),
     ),
     Role(
         profile="lufei-hastings",
@@ -139,7 +144,7 @@ ROLES: tuple[Role, ...] = (
             "auto-post to XHS",
         ),
         skills=(
-            "lufei-content-studio",
+            "creator-content-studio",
             "xhs-viral-analysis",
             "xhs-topic-selection",
             "xhs-script-generation",
@@ -163,7 +168,7 @@ ROLES: tuple[Role, ...] = (
             "give high-stakes final career promises",
             "leak raw meeting transcripts or private CRM fields",
         ),
-        skills=("lufei-member-cs", "xhs-comment-intelligence", "lufei-service-diagnosis"),
+        skills=("creator-member-cs", "xhs-comment-intelligence", "creator-service-diagnosis"),
     ),
     Role(
         profile="lufei-nadella",
@@ -182,7 +187,7 @@ ROLES: tuple[Role, ...] = (
             "change product scope without Elon Mask task approval",
             "store secrets in wiki markdown",
         ),
-        skills=("lufei-system-integration", "lufei-data-intake"),
+        skills=("creator-system-integration", "creator-data-intake"),
     ),
     Role(
         profile="lufei-altman",
@@ -203,7 +208,7 @@ ROLES: tuple[Role, ...] = (
             "silently accept uncited claims",
             "merge private student data into public-facing concepts",
         ),
-        skills=("lufei-quality-gate",),
+        skills=("creator-quality-gate",),
     ),
 )
 
@@ -536,8 +541,31 @@ def skill_source_dir(skills_path: Path) -> Path:
     return skills_path / "skills"
 
 
+def find_skill_source(source_root: Path, skill_name: str) -> Path:
+    direct = source_root / skill_name
+    if (direct / "SKILL.md").exists():
+        return direct
+    matches = sorted(source_root.glob(f"*/{skill_name}"))
+    for candidate in matches:
+        if (candidate / "SKILL.md").exists():
+            return candidate
+    return direct
+
+
 def profile_skill_link(profile: str, skill_name: str) -> Path:
     return profiles_root() / profile / "skills" / LUFEI_SKILL_CATEGORY / skill_name
+
+
+def profile_declared_skills(profile_dir: Path) -> set[str]:
+    skills_yaml = profile_dir / "skills.yaml"
+    if not skills_yaml.exists():
+        return set()
+    declared: set[str] = set()
+    for line in skills_yaml.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            declared.add(stripped[2:].strip().strip('"').strip("'"))
+    return declared
 
 
 def sync_profile_skills(
@@ -549,14 +577,14 @@ def sync_profile_skills(
 
     Hermes discovers skills from ``$HERMES_HOME/skills``. Kanban workers run
     with the assignee profile as ``HERMES_HOME``, so each Lufei profile needs
-    a lightweight pointer to the shared xhs-content-pipeline skill source.
+    a lightweight pointer to the shared hermes-skills skill source.
     """
 
     source_root = skill_source_dir(skills_path)
     results: list[dict[str, object]] = []
     for role in ROLES:
         for skill_name in role.skills:
-            source = source_root / skill_name
+            source = find_skill_source(source_root, skill_name)
             target = profile_skill_link(role.profile, skill_name)
             row: dict[str, object] = {
                 "profile": role.profile,
@@ -838,31 +866,31 @@ def worker_instruction(
             return (
                 "执行说明 / Jeff Bezos:\n"
                 f"{common}\n"
-                "1. 使用 `lufei-member-cs` 对客户消息做意图分类：简历、作品集、面试复盘、课程、价格、群、资料或其他。\n"
+                "1. 使用 `creator-member-cs` 对客户消息做意图分类：简历、作品集、面试复盘、课程、价格、群、资料或其他。\n"
                 "2. 生成 CRM 入库字段：客户阶段、需求摘要、证据原文、推荐下一步、跟进时间、风险标签。\n"
                 "3. 输出一版安全首轮回复，语气像路飞团队，不替路飞承诺 offer、价格优惠或最终诊断结果。\n"
                 "4. 需要人工确认的信息列入追问清单。\n"
                 "5. 必须把可审阅全文同时写入 wiki staging："
-                "`/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki/staging/customer-signal-crm-<task_id>.md`，"
+                f"`{wiki_path}/staging/customer-signal-crm-<task_id>.md`，"
                 "root blackboard 里的 artifact 必须指向这个持久化路径，不要只指向 scratch workspace。"
             )
         if profile == "lufei-jobs":
             return (
                 "执行说明 / Steve Jobs:\n"
                 f"{common}\n"
-                "1. 使用 `lufei-service-diagnosis` 把客户问题拆成可交付的服务诊断草稿。\n"
+                "1. 使用 `creator-service-diagnosis` 把客户问题拆成可交付的服务诊断草稿。\n"
                 "2. 明确该用户适合：简历点评、作品集点评、面试复盘、体验咨询、求职群、课程资料或暂不适合。\n"
                 "3. 给出服务边界：AI 可答什么，必须由路飞本人判断什么。\n"
                 "4. 不设计新的收费 SKU，只做当前服务承接与诊断。\n"
                 "5. 必须把可审阅全文同时写入 wiki staging："
-                "`/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki/staging/service-flow-ux-diagnosis-<task_id>.md`，"
+                f"`{wiki_path}/staging/service-flow-ux-diagnosis-<task_id>.md`，"
                 "root blackboard 里的 artifact 必须指向这个持久化路径，不要只指向 scratch workspace。"
             )
         if profile == "lufei-altman":
             return (
                 "执行说明 / Sam Altman:\n"
                 f"{common}\n"
-                "1. 使用 `lufei-quality-gate` 检查客服分类、CRM 字段、服务诊断和客户回复。\n"
+                "1. 使用 `creator-quality-gate` 检查客服分类、CRM 字段、服务诊断和客户回复。\n"
                 "2. 重点检查：是否泄露 CRM/private 信息，是否过度承诺结果，是否缺少证据，是否与路飞 persona 不一致。\n"
                 "3. 通过则标记 PASS；不通过则 BLOCK，并列出必须补齐的字段。"
             )
@@ -1126,10 +1154,12 @@ def setup_profiles(
 
 def doctor(wiki_path: Path, skills_path: Path) -> dict[str, object]:
     root = profiles_root()
+    source_root = skill_source_dir(skills_path)
     profiles = []
     for role in ROLES:
         profile_dir = root / role.profile
         soul_path = profile_dir / "SOUL.md"
+        declared_skills = profile_declared_skills(profile_dir)
         profiles.append(
             {
                 "profile": role.profile,
@@ -1137,7 +1167,14 @@ def doctor(wiki_path: Path, skills_path: Path) -> dict[str, object]:
                 "exists": profile_dir.exists(),
                 "soul_exists": soul_path.exists(),
                 "skills": {
-                    skill_name: profile_skill_link(role.profile, skill_name).exists()
+                    skill_name: (
+                        skill_name in declared_skills
+                        or profile_skill_link(role.profile, skill_name).exists()
+                    )
+                    for skill_name in role.skills
+                },
+                "skill_sources": {
+                    skill_name: (find_skill_source(source_root, skill_name) / "SKILL.md").exists()
                     for skill_name in role.skills
                 },
             }
@@ -1156,7 +1193,7 @@ def doctor(wiki_path: Path, skills_path: Path) -> dict[str, object]:
         "skills_path": str(skills_path),
         "skills_exists": skills_path.exists(),
         "skill_sources": {
-            skill_name: (skill_source_dir(skills_path) / skill_name / "SKILL.md").exists()
+            skill_name: (find_skill_source(source_root, skill_name) / "SKILL.md").exists()
             for skill_name in LUFEI_SKILL_NAMES
         },
         "task_types": sorted(TASK_TEMPLATES),
@@ -1175,7 +1212,7 @@ def main(argv: list[str] | None = None) -> int:
     p_setup.add_argument("--dry-run", action="store_true")
     p_setup.add_argument("--force-soul", action="store_true", help="Rewrite existing SOUL.md files")
 
-    p_sync = sub.add_parser("sync-skills", help="Bind xhs-content-pipeline skills into every Lufei profile")
+    p_sync = sub.add_parser("sync-skills", help="Bind hermes-skills skills into every Lufei profile")
     p_sync.add_argument("--dry-run", action="store_true")
 
     p_soul = sub.add_parser("render-soul", help="Print one role's SOUL.md")

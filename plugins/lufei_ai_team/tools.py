@@ -37,7 +37,8 @@ LUFEI_AI_TEAM_ORCHESTRATE_SCHEMA: dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Optional Obsidian llm-wiki root. Defaults to the local "
-                    "lufei-xhs-wiki vault."
+                    "creator wiki configured by HERMES_XHS_WIKI_PATH or the "
+                    "local /Users/champion/Documents/develop/lufei/wiki vault."
                 ),
             },
             "run_id": {

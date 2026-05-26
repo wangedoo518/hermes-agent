@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -27,8 +28,13 @@ from zoneinfo import ZoneInfo
 
 DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 DEFAULT_WIKI_PATH = Path(
-    "/Users/champion/Documents/develop/Wiki/ClaudeWiki/lufei-xhs-wiki"
-)
+    os.getenv("HERMES_XHS_WIKI_PATH")
+    or os.getenv("HERMES_CREATOR_WIKI_PATH")
+    or os.getenv("LUFEI_XHS_WIKI_PATH")
+    or os.getenv("XHS_WIKI_PATH")
+    or os.getenv("WIKI_PATH")
+    or "/Users/champion/Documents/develop/lufei/wiki"
+).expanduser()
 DETAIL_MATCH_PATTERNS = (
     "record-detail",
     "cloud-record",
