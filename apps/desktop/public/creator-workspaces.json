@@ -7,7 +7,7 @@
       "displayName": "路飞设计沉思录",
       "description": "Creator workspace for the lufei profile.",
       "gatewayUrl": "https://claudewiki.cn/hermes",
-      "authMode": "none"
+      "authMode": "token"
     },
     {
       "id": "career-coach",
@@ -15,8 +15,7 @@
       "displayName": "求职咨询助手",
       "description": "Creator workspace for career coaching sessions.",
       "gatewayUrl": "https://claudewiki.cn/hermes",
-      "authMode": "none"
+      "authMode": "token"
     }
   ]
 }
-

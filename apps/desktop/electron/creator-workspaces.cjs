@@ -35,7 +35,7 @@ function normalizeCreatorWorkspace(raw, index = 0) {
     profile,
     displayName,
     gatewayUrl: normalizeRemoteBaseUrl(gatewayUrl),
-    authMode: normAuthMode(raw.authMode || raw.auth_mode || 'none')
+    authMode: normAuthMode(raw.authMode || raw.auth_mode || 'token')
   }
 
   const description = stringValue(raw.description)
@@ -97,4 +97,3 @@ module.exports = {
   normalizeCreatorWorkspacesManifest,
   parseCreatorWorkspacesJson
 }
-

@@ -6,7 +6,7 @@ const {
   parseCreatorWorkspacesJson
 } = require('./creator-workspaces.cjs')
 
-test('normalizes workspaces and defaults auth mode to none', () => {
+test('normalizes workspaces and defaults auth mode to token', () => {
   const manifest = normalizeCreatorWorkspacesManifest({
     workspaces: [
       {
@@ -27,7 +27,7 @@ test('normalizes workspaces and defaults auth mode to none', () => {
         profile: 'lufei-creator-profile',
         displayName: '路飞设计沉思录',
         gatewayUrl: 'https://claudewiki.cn/hermes',
-        authMode: 'none'
+        authMode: 'token'
       }
     ]
   })
@@ -66,4 +66,3 @@ test('rejects duplicate workspace ids', () => {
 test('parseCreatorWorkspacesJson reports invalid JSON', () => {
   assert.throws(() => parseCreatorWorkspacesJson('{nope'), /Invalid creator workspaces JSON/)
 })
-
