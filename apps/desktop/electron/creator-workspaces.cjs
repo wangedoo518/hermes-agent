@@ -35,7 +35,7 @@ function normalizeCreatorWorkspace(raw, index = 0) {
     profile,
     displayName,
     gatewayUrl: normalizeRemoteBaseUrl(gatewayUrl),
-    authMode: normAuthMode(raw.authMode || raw.auth_mode || 'token')
+    authMode: normAuthMode(raw.authMode || raw.auth_mode || 'oauth')
   }
 
   const description = stringValue(raw.description)

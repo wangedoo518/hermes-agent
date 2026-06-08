@@ -6,7 +6,7 @@ const {
   parseCreatorWorkspacesJson
 } = require('./creator-workspaces.cjs')
 
-test('normalizes workspaces and defaults auth mode to token', () => {
+test('normalizes workspaces and defaults auth mode to oauth', () => {
   const manifest = normalizeCreatorWorkspacesManifest({
     workspaces: [
       {
@@ -27,7 +27,7 @@ test('normalizes workspaces and defaults auth mode to token', () => {
         profile: 'lufei-creator-profile',
         displayName: '路飞设计沉思录',
         gatewayUrl: 'https://claudewiki.cn/hermes',
-        authMode: 'token'
+        authMode: 'oauth'
       }
     ]
   })
@@ -37,7 +37,7 @@ test('accepts tenants as a compatibility alias', () => {
   const manifest = normalizeCreatorWorkspacesManifest({
     tenants: [
       {
-        authMode: 'token',
+        authMode: 'oauth',
         displayName: '求职咨询助手',
         gatewayUrl: 'https://claudewiki.cn/hermes',
         id: 'career-coach',
@@ -46,8 +46,24 @@ test('accepts tenants as a compatibility alias', () => {
     ]
   })
 
-  assert.equal(manifest.workspaces[0].authMode, 'token')
+  assert.equal(manifest.workspaces[0].authMode, 'oauth')
   assert.equal(manifest.workspaces[0].id, 'career-coach')
+})
+
+test('keeps explicit token auth for fallback manifests', () => {
+  const manifest = normalizeCreatorWorkspacesManifest({
+    workspaces: [
+      {
+        authMode: 'token',
+        displayName: 'Fallback',
+        gatewayUrl: 'https://fallback.example.com/hermes',
+        id: 'fallback',
+        profile: 'fallback'
+      }
+    ]
+  })
+
+  assert.equal(manifest.workspaces[0].authMode, 'token')
 })
 
 test('rejects duplicate workspace ids', () => {

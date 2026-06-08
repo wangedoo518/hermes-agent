@@ -75,9 +75,11 @@ npm run dev:fake-boot   # exercise the startup overlay with deterministic delays
 ### Creator workspace mode
 
 Hermes Creator Desktop can start in a creator workspace picker. The picker
-loads a manifest, lets the creator choose a workspace, prompts once for the
-workspace token when `authMode: "token"`, then saves that workspace's `profile`
-and `gatewayUrl` as a per-profile remote override.
+loads a manifest, lets the creator choose a workspace, then saves that
+workspace's `profile` and `gatewayUrl` as a per-profile remote override. For
+`authMode: "oauth"` gateways, Desktop opens the official Hermes sign-in window;
+the same flow renders the dashboard username/password form when the remote
+gateway is configured with the bundled Basic Auth provider.
 
 Configuration sources, in priority order:
 
@@ -90,8 +92,12 @@ HERMES_CREATOR_WORKSPACES_FILE='/path/to/creator-workspaces.json'
 If no override is set, the app uses
 `public/creator-workspaces.json`, which currently contains the `lufei` and
 `career-coach` workspaces pointing at `https://claudewiki.cn/hermes` with
-`authMode: "token"`. Tokens are never stored in the public manifest; the creator
-enters the token on first bind and Desktop persists it locally.
+`authMode: "oauth"`. Dashboard usernames and passwords are configured on each
+remote Hermes gateway with `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`,
+`HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` or `_PASSWORD_HASH`, and
+`HERMES_DASHBOARD_BASIC_AUTH_SECRET`; they are never stored in the public
+manifest. `authMode: "token"` remains available for self-hosted fallback
+deployments but is not the creator-facing MVP path.
 
 ### Building installers
 

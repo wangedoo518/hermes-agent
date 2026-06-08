@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { DesktopCreatorWorkspace, DesktopCreatorWorkspacesManifest } from '@/global'
-import { AlertCircle, Check, Globe, KeyRound, Layers3, Loader2, RefreshCw } from '@/lib/icons'
+import { AlertCircle, Check, Globe, KeyRound, Layers3, Loader2, LogIn, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 type GateStatus = 'error' | 'loading' | 'needs-selection' | 'ready'
@@ -111,6 +111,15 @@ export function useCreatorWorkspaceGate(): CreatorWorkspaceGate {
         remoteToken: workspace.authMode === 'token' ? token : undefined,
         remoteUrl: workspace.gatewayUrl
       })
+
+      if (workspace.authMode === 'oauth') {
+        const result = await desktop.oauthLoginConnectionConfig(workspace.gatewayUrl)
+
+        if (!result?.connected) {
+          throw new Error('Sign in did not complete. Try again to connect this workspace.')
+        }
+      }
+
       await desktop.creatorWorkspaces.setSelection(workspace.id)
       setSelectedId(workspace.id)
       setStatus('ready')
@@ -162,7 +171,7 @@ export function CreatorWorkspacePickerOverlay({ gate }: { gate: CreatorWorkspace
             </div>
             <h1 className="text-2xl font-semibold tracking-normal text-(--ui-text-primary)">Choose your workspace</h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-(--ui-text-tertiary)">
-              Pick the creator space this Desktop should load. Hermes will connect directly to that workspace gateway.
+              Pick the creator space this Desktop should load. Secured gateways open the official Hermes sign-in window.
             </p>
           </div>
           {!required && gate.selectedWorkspace ? (
@@ -199,6 +208,7 @@ export function CreatorWorkspacePickerOverlay({ gate }: { gate: CreatorWorkspace
               const selected = gate.selectedWorkspace?.id === workspace.id
               const applying = gate.applyingId === workspace.id
               const needsToken = workspace.authMode === 'token'
+              const needsSignIn = workspace.authMode === 'oauth'
               const tokenOpen = tokenWorkspaceId === workspace.id
               const token = tokens[workspace.id] ?? ''
 
@@ -248,6 +258,8 @@ export function CreatorWorkspacePickerOverlay({ gate }: { gate: CreatorWorkspace
                       <div className="grid size-9 shrink-0 place-items-center rounded-md bg-(--ui-bg-quaternary) text-(--ui-text-secondary)">
                         {applying ? (
                           <Loader2 className="size-4 animate-spin" />
+                        ) : needsSignIn ? (
+                          <LogIn className="size-4" />
                         ) : needsToken ? (
                           <KeyRound className="size-4" />
                         ) : (
@@ -302,7 +314,11 @@ export function CreatorWorkspacePickerOverlay({ gate }: { gate: CreatorWorkspace
                       {workspace.gatewayUrl}
                     </span>
                     <span className="shrink-0 rounded-full bg-(--ui-bg-quaternary) px-2 py-0.5 text-[0.625rem] uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
-                      {workspace.authMode === 'token' ? 'token' : workspace.authMode === 'none' ? 'no login' : workspace.authMode}
+                      {workspace.authMode === 'oauth'
+                        ? 'sign in'
+                        : workspace.authMode === 'token'
+                          ? 'token'
+                          : 'no login'}
                     </span>
                   </div>
                 </div>
