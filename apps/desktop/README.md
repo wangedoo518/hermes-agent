@@ -72,6 +72,25 @@ HERMES_HOME=/tmp/throwaway npm run dev
 npm run dev:fake-boot   # exercise the startup overlay with deterministic delays
 ```
 
+### Creator workspace mode
+
+Hermes Creator Desktop can start in a no-login workspace picker. The picker
+loads a manifest, lets the creator choose a workspace, then saves that
+workspace's `profile` and `gatewayUrl` as a per-profile remote override.
+
+Configuration sources, in priority order:
+
+```bash
+HERMES_CREATOR_WORKSPACES_JSON='{"workspaces":[...]}'
+HERMES_CREATOR_WORKSPACES_URL='http://47.114.95.173:8088/workspaces'
+HERMES_CREATOR_WORKSPACES_FILE='/path/to/creator-workspaces.json'
+```
+
+If no override is set, the app uses
+`public/creator-workspaces.json`, which currently contains the `lufei` and
+`career-coach` workspaces pointing at `https://claudewiki.cn/hermes` with
+`authMode: "none"`.
+
 ### Building installers
 
 ```bash

@@ -13,6 +13,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   probeConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:probe', remoteUrl),
   oauthLoginConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-login', remoteUrl),
   oauthLogoutConnectionConfig: remoteUrl => ipcRenderer.invoke('hermes:connection-config:oauth-logout', remoteUrl),
+  creatorWorkspaces: {
+    list: () => ipcRenderer.invoke('hermes:creator-workspaces:list'),
+    getSelection: () => ipcRenderer.invoke('hermes:creator-workspaces:get-selection'),
+    setSelection: workspaceId => ipcRenderer.invoke('hermes:creator-workspaces:set-selection', workspaceId)
+  },
   profile: {
     get: () => ipcRenderer.invoke('hermes:profile:get'),
     set: name => ipcRenderer.invoke('hermes:profile:set', name)

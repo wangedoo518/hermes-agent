@@ -26,6 +26,11 @@ declare global {
       probeConnectionConfig: (remoteUrl: string) => Promise<DesktopConnectionProbeResult>
       oauthLoginConnectionConfig: (remoteUrl: string) => Promise<DesktopOauthLoginResult>
       oauthLogoutConnectionConfig: (remoteUrl?: string) => Promise<DesktopOauthLogoutResult>
+      creatorWorkspaces: {
+        getSelection: () => Promise<DesktopCreatorWorkspaceSelection>
+        list: () => Promise<DesktopCreatorWorkspacesManifest>
+        setSelection: (workspaceId: null | string) => Promise<DesktopCreatorWorkspaceSelection>
+      }
       profile: {
         get: () => Promise<DesktopActiveProfile>
         // Persists the desktop's profile choice and relaunches the local
@@ -193,10 +198,10 @@ export interface HermesConnection {
   baseUrl: string
   isFullscreen: boolean
   mode?: 'local' | 'remote'
-  authMode?: 'oauth' | 'token'
+  authMode?: DesktopRemoteAuthMode
   nativeOverlayWidth: number
   source?: 'env' | 'local' | 'settings'
-  token: string
+  token: null | string
   wsUrl: string
   logs: string[]
   // Set for pool (non-primary) backends so the renderer knows which profile a
@@ -228,7 +233,7 @@ export interface DesktopConnectionConfig {
   // The profile this config describes, or null for the global/default
   // connection. Per-profile entries let a profile point at its own backend.
   profile: null | string
-  remoteAuthMode: 'oauth' | 'token'
+  remoteAuthMode: DesktopRemoteAuthMode
   remoteOauthConnected: boolean
   remoteTokenPreview: string | null
   remoteTokenSet: boolean
@@ -240,7 +245,7 @@ export interface DesktopConnectionConfigInput {
   // When set, the save/apply/test targets this profile's per-profile remote
   // override instead of the global connection.
   profile?: null | string
-  remoteAuthMode?: 'oauth' | 'token'
+  remoteAuthMode?: DesktopRemoteAuthMode
   remoteToken?: string
   remoteUrl?: string
 }
@@ -264,7 +269,7 @@ export interface DesktopAuthProvider {
 export interface DesktopConnectionProbeResult {
   baseUrl: string
   reachable: boolean
-  authMode: 'oauth' | 'token' | 'unknown'
+  authMode: DesktopRemoteAuthMode | 'unknown'
   providers: DesktopAuthProvider[]
   version: string | null
   error: string | null
@@ -279,6 +284,27 @@ export interface DesktopOauthLoginResult {
 export interface DesktopOauthLogoutResult {
   ok: boolean
   connected: boolean
+}
+
+export type DesktopRemoteAuthMode = 'none' | 'oauth' | 'token'
+
+export interface DesktopCreatorWorkspace {
+  authMode: DesktopRemoteAuthMode
+  description?: string
+  displayName: string
+  gatewayUrl: string
+  id: string
+  profile: string
+}
+
+export interface DesktopCreatorWorkspacesManifest {
+  source: string
+  version: number
+  workspaces: DesktopCreatorWorkspace[]
+}
+
+export interface DesktopCreatorWorkspaceSelection {
+  workspaceId: null | string
 }
 
 export interface DesktopBootProgress {

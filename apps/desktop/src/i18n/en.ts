@@ -394,6 +394,8 @@ export const en: Translations = {
       authSignedInOauth: 'This gateway uses OAuth. You are signed in; the session refreshes automatically.',
       authNeedsPassword: 'This gateway uses a username and password. Sign in to authorize this desktop app.',
       authNeedsOauth: provider => `This gateway uses OAuth. Sign in with ${provider} to authorize this desktop app.`,
+      noAuthPill: 'No login',
+      noAuthDesc: 'This gateway is configured as a trusted workspace and will be used without Desktop sign-in.',
       tokenTitle: 'Session token',
       tokenDesc: 'The dashboard session token used for REST and WebSocket access. Leave blank to keep the saved token.',
       existingToken: value => `Existing token ${value}`,

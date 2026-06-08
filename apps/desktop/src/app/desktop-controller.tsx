@@ -9,6 +9,7 @@ import { DesktopOnboardingOverlay } from '@/components/desktop-onboarding-overla
 import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overlay'
 import { Pane, PaneMain } from '@/components/pane-shell'
 import { useMediaQuery } from '@/hooks/use-media-query'
+import { Layers3 } from '@/lib/icons'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
@@ -105,6 +106,7 @@ import type { StatusbarItem } from './shell/statusbar-controls'
 import type { TitlebarTool } from './shell/titlebar-controls'
 import { useGroupRegistry } from './shell/use-group-registry'
 import { UpdatesOverlay } from './updates-overlay'
+import { CreatorWorkspacePickerOverlay, useCreatorWorkspaceGate } from './workspaces/creator-workspace-picker'
 
 const AgentsView = lazy(async () => ({ default: (await import('./agents')).AgentsView }))
 const ArtifactsView = lazy(async () => ({ default: (await import('./artifacts')).ArtifactsView }))
@@ -175,6 +177,7 @@ export function DesktopController() {
   const terminalTakeover = useStore($terminalTakeover)
   const panesFlipped = useStore($panesFlipped)
   const profileScope = useStore($profileScope)
+  const creatorWorkspaceGate = useCreatorWorkspaceGate()
   // Below SIDEBAR_COLLAPSE_BREAKPOINT_PX there's no room for a docked rail —
   // collapse both sidebars (without touching their stored open state) so the
   // hover-reveal overlay becomes the way in. Restores once it's wide again.
@@ -628,6 +631,7 @@ export function DesktopController() {
     })
 
   useGatewayBoot({
+    enabled: creatorWorkspaceGate.bootEnabled,
     handleGatewayEvent: handleDesktopGatewayEvent,
     onConnectionReady: c => {
       connectionRef.current = c
@@ -682,10 +686,41 @@ export function DesktopController() {
     startFreshSessionDraft
   })
 
+  const creatorWorkspaceStatusItems = useMemo<StatusbarItem[]>(() => {
+    const workspaces = creatorWorkspaceGate.manifest?.workspaces ?? []
+
+    if (workspaces.length === 0) {
+      return []
+    }
+
+    const selected = creatorWorkspaceGate.selectedWorkspace
+
+    return [
+      {
+        detail: selected?.profile,
+        disabled: Boolean(creatorWorkspaceGate.applyingId),
+        icon: <Layers3 className="size-3" />,
+        id: 'creator-workspace',
+        label: selected?.displayName ?? 'Workspace',
+        menuClassName: 'w-72',
+        menuItems: workspaces.map(workspace => ({
+          disabled: Boolean(creatorWorkspaceGate.applyingId),
+          icon: selected?.id === workspace.id ? <span className="text-primary">✓</span> : <span />,
+          id: workspace.id,
+          label: workspace.displayName,
+          onSelect: () => void creatorWorkspaceGate.selectWorkspace(workspace),
+          title: workspace.profile
+        })),
+        title: selected ? `Workspace: ${selected.displayName}` : 'Choose workspace',
+        variant: 'menu'
+      }
+    ]
+  }, [creatorWorkspaceGate])
+
   const { leftStatusbarItems, statusbarItems } = useStatusbarItems({
     agentsOpen,
     commandCenterOpen,
-    extraLeftItems: statusbarItemGroups.flat.left,
+    extraLeftItems: [...statusbarItemGroups.flat.left, ...creatorWorkspaceStatusItems],
     extraRightItems: statusbarItemGroups.flat.right,
     gatewayLogLines,
     gatewayState,
@@ -724,6 +759,7 @@ export function DesktopController() {
   const overlays = (
     <>
       <DesktopInstallOverlay />
+      <CreatorWorkspacePickerOverlay gate={creatorWorkspaceGate} />
       {/* One PTY-backed terminal mounted forever; <TerminalSlot /> placeholders
           decide where it shows. Toggling fullscreen never rebuilds the shell. */}
       <PersistentTerminal cwd={currentCwd} onAddSelectionToChat={composer.addTerminalSelectionAttachment} />

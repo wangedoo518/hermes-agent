@@ -3,7 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import type { DesktopAuthProvider, DesktopConnectionProbeResult } from '@/global'
+import type { DesktopAuthProvider, DesktopConnectionProbeResult, DesktopRemoteAuthMode } from '@/global'
 import { useI18n } from '@/i18n'
 import { AlertCircle, Check, FileText, Globe, Loader2, LogIn, Monitor } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -14,7 +14,7 @@ import { CONTROL_TEXT } from './constants'
 import { EmptyState, ListRow, LoadingState, Pill, SettingsContent } from './primitives'
 
 type Mode = 'local' | 'remote'
-type AuthMode = 'oauth' | 'token'
+type AuthMode = DesktopRemoteAuthMode
 type ProbeStatus = 'idle' | 'probing' | 'done' | 'error'
 
 interface GatewaySettingsState {
@@ -155,7 +155,7 @@ export function GatewaySettings() {
       })
 
     return () => void (cancelled = true)
-  }, [scope])
+  }, [g.failedLoad, scope])
 
   // Debounced probe of the entered remote URL. Only runs in remote mode with a
   // syntactically plausible URL. The probe result drives whether we render the
@@ -206,6 +206,10 @@ export function GatewaySettings() {
   // Effective auth mode: a reachable probe wins; otherwise fall back to the
   // saved config's mode so a re-open of settings doesn't flicker.
   const authMode: AuthMode = useMemo(() => {
+    if (state.remoteAuthMode === 'none') {
+      return 'none'
+    }
+
     if (probeStatus === 'done' && probe && probe.authMode !== 'unknown') {
       return probe.authMode
     }
@@ -224,7 +228,7 @@ export function GatewaySettings() {
   //     its control appears immediately with no flicker.
   // While probing (or after a probe error), the scheme is unknown and we show
   // the probe status row instead of a control.
-  const hasSavedRemote = state.remoteTokenSet || state.remoteOauthConnected
+  const hasSavedRemote = state.remoteAuthMode === 'none' || state.remoteTokenSet || state.remoteOauthConnected
 
   const authResolved = useMemo(() => {
     if (probeStatus === 'done') {
@@ -276,6 +280,10 @@ export function GatewaySettings() {
       return oauthConnected
     }
 
+    if (authMode === 'none') {
+      return true
+    }
+
     return Boolean(remoteToken.trim()) || state.remoteTokenSet
   }, [authMode, oauthConnected, remoteToken, state.remoteTokenSet, trimmedUrl])
 
@@ -293,9 +301,7 @@ export function GatewaySettings() {
         kind: 'warning',
         title: g.incompleteTitle,
         message:
-          authMode === 'oauth'
-            ? g.incompleteSignIn
-            : g.incompleteToken
+          authMode === 'oauth' ? g.incompleteSignIn : g.incompleteToken
       })
 
       return
@@ -387,9 +393,7 @@ export function GatewaySettings() {
         kind: 'warning',
         title: g.incompleteTitle,
         message:
-          authMode === 'oauth'
-            ? g.incompleteSignInTest
-            : g.incompleteTokenTest
+              authMode === 'oauth' ? g.incompleteSignInTest : g.incompleteTokenTest
       })
 
       return
@@ -577,6 +581,14 @@ export function GatewaySettings() {
             }
             description={g.tokenDesc}
             title={g.tokenTitle}
+          />
+        ) : null}
+
+        {state.mode === 'remote' && authResolved && authMode === 'none' ? (
+          <ListRow
+            action={<Pill tone="primary">{g.noAuthPill ?? 'No login'}</Pill>}
+            description={g.noAuthDesc ?? 'This gateway is configured as a trusted workspace and will be used without Desktop sign-in.'}
+            title={g.authTitle}
           />
         ) : null}
       </div>

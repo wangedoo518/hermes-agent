@@ -19,6 +19,7 @@ const {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  buildGatewayWsUrlWithoutAuth,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
@@ -40,6 +41,7 @@ test('connectionScopeKey trims to a name or null for the global scope', () => {
 })
 
 test('normAuthMode coerces to token unless explicitly oauth', () => {
+  assert.equal(normAuthMode('none'), 'none')
   assert.equal(normAuthMode('oauth'), 'oauth')
   assert.equal(normAuthMode('token'), 'token')
   assert.equal(normAuthMode(undefined), 'token')
@@ -82,6 +84,11 @@ test('profileRemoteOverride returns the per-profile remote with defaulted auth m
 test('profileRemoteOverride preserves an explicit oauth auth mode', () => {
   const config = { profiles: { coder: { mode: 'remote', url: 'https://x', authMode: 'oauth' } } }
   assert.equal(profileRemoteOverride(config, 'coder').authMode, 'oauth')
+})
+
+test('profileRemoteOverride preserves an explicit none auth mode', () => {
+  const config = { profiles: { creator: { mode: 'remote', url: 'https://x', authMode: 'none' } } }
+  assert.equal(profileRemoteOverride(config, 'creator').authMode, 'none')
 })
 
 test('profileRemoteOverride tolerates a missing/!object profiles map', () => {
@@ -146,6 +153,13 @@ test('buildGatewayWsUrlWithTicket url-encodes the ticket', () => {
   assert.equal(buildGatewayWsUrlWithTicket('https://host', 'a+b/c'), 'wss://host/api/ws?ticket=a%2Bb%2Fc')
 })
 
+// --- buildGatewayWsUrlWithoutAuth (none) ---
+
+test('buildGatewayWsUrlWithoutAuth uses no credential query params', () => {
+  assert.equal(buildGatewayWsUrlWithoutAuth('https://gw.example.com/hermes'), 'wss://gw.example.com/hermes/api/ws')
+  assert.equal(buildGatewayWsUrlWithoutAuth('http://127.0.0.1:9119'), 'ws://127.0.0.1:9119/api/ws')
+})
+
 // --- authModeFromStatus ---
 
 test('authModeFromStatus returns oauth when auth_required is true', () => {
@@ -162,11 +176,13 @@ test('authModeFromStatus returns token when auth_required is false/missing', () 
 // --- resolveAuthMode ---
 
 test('resolveAuthMode: explicit input wins over existing', () => {
+  assert.equal(resolveAuthMode('none', 'token'), 'none')
   assert.equal(resolveAuthMode('oauth', 'token'), 'oauth')
   assert.equal(resolveAuthMode('token', 'oauth'), 'token')
 })
 
 test('resolveAuthMode: falls back to existing when input absent', () => {
+  assert.equal(resolveAuthMode(undefined, 'none'), 'none')
   assert.equal(resolveAuthMode(undefined, 'oauth'), 'oauth')
   assert.equal(resolveAuthMode(undefined, 'token'), 'token')
   assert.equal(resolveAuthMode('', 'oauth'), 'oauth')
@@ -292,6 +308,11 @@ test('resolveTestWsUrl (token mode) builds a ?token= URL the WS probe can use', 
 
 test('resolveTestWsUrl (token mode, no token) returns null — genuine skip', async () => {
   assert.equal(await resolveTestWsUrl('https://gw.example.com', 'token', null), null)
+})
+
+test('resolveTestWsUrl (none mode) builds a credential-free URL', async () => {
+  const url = await resolveTestWsUrl('https://gw.example.com/hermes', 'none', null)
+  assert.equal(url, 'wss://gw.example.com/hermes/api/ws')
 })
 
 test('resolveTestWsUrl (oauth, mint ok) builds a ?ticket= URL', async () => {

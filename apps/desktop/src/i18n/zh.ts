@@ -591,6 +591,8 @@ export const zh: Translations = {
       authSignedInOauth: '此网关使用 OAuth。你已登录，会话会自动刷新。',
       authNeedsPassword: '此网关使用用户名和密码。请登录以授权此桌面应用。',
       authNeedsOauth: provider => `此网关使用 OAuth。请使用 ${provider} 登录以授权此桌面应用。`,
+      noAuthPill: '免登录',
+      noAuthDesc: '此网关已配置为可信 workspace，Desktop 会直接使用它，不再要求登录。',
       tokenTitle: '会话 token',
       tokenDesc: '用于 REST 和 WebSocket 访问的 dashboard 会话 token。留空则保留已保存的 token。',
       existingToken: value => `现有 token ${value}`,
