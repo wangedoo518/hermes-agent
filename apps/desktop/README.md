@@ -91,9 +91,12 @@ HERMES_CREATOR_WORKSPACES_FILE='/path/to/creator-workspaces.json'
 
 If no override is set, the app uses
 `public/creator-workspaces.json`, which currently contains the `lufei` and
-`career-coach` workspaces pointing at `https://claudewiki.cn/hermes` with
-`authMode: "oauth"`. Dashboard usernames and passwords are configured on each
-remote Hermes gateway with `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`,
+`career-coach` workspaces pointing at their Tencent Cloud Hermes dashboard
+hosts (`http://124.220.29.171:9119` and `http://43.143.118.134:9119`) with
+`authMode: "oauth"`. Those direct HTTP URLs are for trusted-network pilots;
+production creator installs should use HTTPS workspace domains reverse-proxied
+to the same dashboard processes. Dashboard usernames and passwords are
+configured on each remote Hermes gateway with `HERMES_DASHBOARD_BASIC_AUTH_USERNAME`,
 `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` or `_PASSWORD_HASH`, and
 `HERMES_DASHBOARD_BASIC_AUTH_SECRET`; they are never stored in the public
 manifest. `authMode: "token"` remains available for self-hosted fallback

@@ -13,7 +13,7 @@ test('normalizes workspaces and defaults auth mode to oauth', () => {
         id: 'lufei',
         profile: 'lufei-creator-profile',
         displayName: '路飞设计沉思录',
-        gatewayUrl: 'https://claudewiki.cn/hermes/'
+        gatewayUrl: 'http://124.220.29.171:9119/'
       }
     ]
   }, 'test')
@@ -26,7 +26,7 @@ test('normalizes workspaces and defaults auth mode to oauth', () => {
         id: 'lufei',
         profile: 'lufei-creator-profile',
         displayName: '路飞设计沉思录',
-        gatewayUrl: 'https://claudewiki.cn/hermes',
+        gatewayUrl: 'http://124.220.29.171:9119',
         authMode: 'oauth'
       }
     ]
@@ -39,7 +39,7 @@ test('accepts tenants as a compatibility alias', () => {
       {
         authMode: 'oauth',
         displayName: '求职咨询助手',
-        gatewayUrl: 'https://claudewiki.cn/hermes',
+        gatewayUrl: 'http://43.143.118.134:9119',
         id: 'career-coach',
         profile: 'career-coach-copilot'
       }
