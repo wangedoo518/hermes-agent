@@ -2834,6 +2834,7 @@ function fetchHtmlTitleWithCurl(rawUrl) {
 function getLinkTitleSession() {
   if (linkTitleSession || !app.isReady()) return linkTitleSession
   linkTitleSession = session.fromPartition('hermes:link-titles', { cache: false })
+  applyGatewayDirectProxy(linkTitleSession)
   linkTitleSession.webRequest.onBeforeRequest((details, callback) => {
     callback({ cancel: RENDER_TITLE_BLOCKED_RESOURCES.has(details.resourceType) })
   })
@@ -3682,6 +3683,7 @@ const OAUTH_SESSION_PARTITION = 'persist:hermes-remote-oauth'
 function getOauthSession() {
   if (oauthSession || !app.isReady()) return oauthSession
   oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
+  applyGatewayDirectProxy(oauthSession)
   return oauthSession
 }
 
@@ -6305,7 +6307,23 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 // Search the Marketplace for color-theme extensions (empty query = top installs).
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
+// Connect to the remote gateway DIRECTLY, bypassing any system proxy (ClashX /
+// Clash Verge). Routing the gateway through a system proxy in global mode can
+// tunnel via a far-away exit node and produce flaky TLS (handshake resets,
+// 502s, mid-stream WebSocket drops). The gateway sessions only ever talk to the
+// gateway, so forcing them direct is safe and removes the proxy as a failure
+// source.
+function applyGatewayDirectProxy(ses) {
+  if (!ses || typeof ses.setProxy !== 'function') return
+  try {
+    ses.setProxy({ mode: 'direct' }).catch(() => {})
+  } catch {
+    // older electron / already torn down
+  }
+}
+
 app.whenReady().then(() => {
+  applyGatewayDirectProxy(session.defaultSession)
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {
