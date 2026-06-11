@@ -161,7 +161,12 @@ export function CreatorWorkspacePickerOverlay({ gate }: { gate: CreatorWorkspace
   }
 
   return (
-    <div className="fixed inset-0 z-80 grid place-items-center bg-(--ui-bg-primary)/96 px-6 py-8 text-(--ui-text-primary) backdrop-blur-xl [-webkit-app-region:no-drag]">
+    // While this gate blocks the backend boot, the onboarding (z-1300) and
+    // gateway-connecting (z-1200) overlays are both mounted and full-screen —
+    // the picker must sit above them or the app looks stuck on "Starting
+    // Hermes… 2%". Stay below boot-failure/install (z-1400) and the error
+    // boundary (z-1500).
+    <div className="fixed inset-0 z-[1350] grid place-items-center bg-(--ui-bg-primary)/96 px-6 py-8 text-(--ui-text-primary) backdrop-blur-xl [-webkit-app-region:no-drag]">
       <div className="w-full max-w-4xl">
         <div className="mb-7 flex items-start justify-between gap-4">
           <div>
