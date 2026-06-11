@@ -1,0 +1,15 @@
+name: xiaohongshu
+version: 0.1.0
+description: "Xiaohongshu creator-ops tools. Extract user-submitted note/profile links, persist local artifacts, and bridge extracted notes into a local llm-wiki."
+author: azan / Hermes Agent contributors
+kind: backend
+provides_tools:
+  - xhs_extract_note
+  - xhs_extract_profile_notes
+  - xhs_init_lufei_wiki
+  - xhs_ingest_note_to_wiki
+  - xhs_ingest_account_to_wiki
+  - xhs_build_wiki_manifest
+  - xhs_query_wiki_context
+  - xhs_open_wiki_in_obsidian
+  - xhs_run_content_skill

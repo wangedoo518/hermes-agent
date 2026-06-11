@@ -1,0 +1,14 @@
+name: tencentmeeting
+version: 0.1.0
+description: "Tencent Meeting local asset tools. Export tmeet OAuth record transcripts and smart minutes into an Obsidian llm-wiki raw folder."
+author: azan / Hermes Agent contributors
+kind: backend
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - tmeet_export_records_to_obsidian
+  - tmeet_capture_meeting_record_page_cdp
+  - tmeet_capture_record_details_cdp
+  - tmeet_build_lufei_crm
+  - tmeet_query_lufei_crm_context
