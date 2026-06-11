@@ -51,6 +51,7 @@ const {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  buildGatewayWsUrlWithoutAuth,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
@@ -61,6 +62,7 @@ const {
   resolveTestWsUrl,
   tokenPreview
 } = require('./connection-config.cjs')
+const { parseCreatorWorkspacesJson } = require('./creator-workspaces.cjs')
 const {
   DATA_URL_READ_MAX_BYTES,
   DEFAULT_FETCH_TIMEOUT_MS,
@@ -271,6 +273,7 @@ const BOOTSTRAP_MARKER_SCHEMA_VERSION = 1
 
 const DESKTOP_CONNECTION_CONFIG_PATH = path.join(app.getPath('userData'), 'connection.json')
 const DESKTOP_UPDATE_CONFIG_PATH = path.join(app.getPath('userData'), 'updates.json')
+const DESKTOP_CREATOR_WORKSPACE_SELECTION_PATH = path.join(app.getPath('userData'), 'creator-workspace.json')
 // active-profile.json records which Hermes profile the desktop launches its
 // local backend as. When set, startHermes() passes `hermes --profile <name>
 // dashboard …`, which deterministically pins HERMES_HOME (see
@@ -285,6 +288,7 @@ const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
 const DEFAULT_UPDATE_BRANCH = 'main'
+const DEFAULT_CREATOR_WORKSPACES_PATH = path.join(APP_ROOT, 'public', 'creator-workspaces.json')
 // desktop.log lives under HERMES_HOME/logs/ so it sits next to agent.log,
 // errors.log, gateway.log produced by hermes_logging.setup_logging — one log
 // directory per user, regardless of which UI surface produced the line.
@@ -1277,6 +1281,89 @@ function writeFileAtomic(targetPath, data, encoding) {
 function writeDesktopUpdateConfig(config) {
   fs.mkdirSync(path.dirname(DESKTOP_UPDATE_CONFIG_PATH), { recursive: true })
   writeFileAtomic(DESKTOP_UPDATE_CONFIG_PATH, JSON.stringify(config, null, 2))
+}
+
+function fetchText(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    let parsed
+    try {
+      parsed = new URL(url)
+    } catch (error) {
+      reject(new Error(`Invalid URL: ${error.message}`))
+      return
+    }
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported URL protocol: ${parsed.protocol}`))
+      return
+    }
+
+    const client = parsed.protocol === 'https:' ? https : http
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+    const req = client.request(parsed, { method: 'GET' }, res => {
+      const chunks = []
+      res.on('error', reject)
+      res.on('data', chunk => chunks.push(chunk))
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        if ((res.statusCode || 500) >= 400) {
+          reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+          return
+        }
+        resolve(text)
+      })
+    })
+
+    req.on('error', reject)
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timed out fetching ${url} after ${timeoutMs}ms`))
+    })
+    req.end()
+  })
+}
+
+function readCreatorWorkspaceSelection() {
+  try {
+    const raw = fs.readFileSync(DESKTOP_CREATOR_WORKSPACE_SELECTION_PATH, 'utf8')
+    const parsed = JSON.parse(raw)
+    const workspaceId = typeof parsed?.workspaceId === 'string' ? parsed.workspaceId.trim() : ''
+
+    return { workspaceId: workspaceId || null }
+  } catch {
+    return { workspaceId: null }
+  }
+}
+
+function writeCreatorWorkspaceSelection(workspaceId) {
+  const value = typeof workspaceId === 'string' ? workspaceId.trim() : ''
+  fs.mkdirSync(path.dirname(DESKTOP_CREATOR_WORKSPACE_SELECTION_PATH), { recursive: true })
+  writeFileAtomic(
+    DESKTOP_CREATOR_WORKSPACE_SELECTION_PATH,
+    JSON.stringify({ workspaceId: value || null }, null, 2)
+  )
+
+  return { workspaceId: value || null }
+}
+
+async function readCreatorWorkspacesManifest() {
+  const rawJson = process.env.HERMES_CREATOR_WORKSPACES_JSON
+  if (rawJson) {
+    return parseCreatorWorkspacesJson(rawJson, 'env:HERMES_CREATOR_WORKSPACES_JSON')
+  }
+
+  const rawUrl = String(process.env.HERMES_CREATOR_WORKSPACES_URL || '').trim()
+  if (rawUrl) {
+    const text = await fetchText(rawUrl, { timeoutMs: 8_000 })
+    return parseCreatorWorkspacesJson(text, rawUrl)
+  }
+
+  const rawFile = String(process.env.HERMES_CREATOR_WORKSPACES_FILE || '').trim()
+  const filePath = rawFile ? path.resolve(rawFile) : DEFAULT_CREATOR_WORKSPACES_PATH
+  if (!fileExists(filePath)) {
+    return { source: 'none', version: 1, workspaces: [] }
+  }
+
+  return parseCreatorWorkspacesJson(fs.readFileSync(filePath, 'utf8'), filePath)
 }
 
 // Match the backend's source resolution but bias toward a real git checkout.
@@ -2476,7 +2563,7 @@ function fetchJson(url, token, options = {}) {
         method: options.method || 'GET',
         headers: {
           'Content-Type': 'application/json',
-          'X-Hermes-Session-Token': token,
+          ...(token ? { 'X-Hermes-Session-Token': token } : {}),
           ...(body ? { 'Content-Length': String(body.length) } : {})
         }
       },
@@ -2750,6 +2837,7 @@ function fetchHtmlTitleWithCurl(rawUrl) {
 function getLinkTitleSession() {
   if (linkTitleSession || !app.isReady()) return linkTitleSession
   linkTitleSession = session.fromPartition('hermes:link-titles', { cache: false })
+  applyGatewayDirectProxy(linkTitleSession)
   linkTitleSession.webRequest.onBeforeRequest((details, callback) => {
     callback({ cancel: RENDER_TITLE_BLOCKED_RESOURCES.has(details.resourceType) })
   })
@@ -3597,6 +3685,7 @@ const OAUTH_SESSION_PARTITION = 'persist:hermes-remote-oauth'
 function getOauthSession() {
   if (oauthSession || !app.isReady()) return oauthSession
   oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
+  applyGatewayDirectProxy(oauthSession)
   return oauthSession
 }
 
@@ -3862,7 +3951,7 @@ async function freshGatewayWsUrl(profile) {
     const ticket = await mintGatewayWsTicket(connection.baseUrl)
     return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
   }
-  // Local/token: the cached wsUrl already carries the (long-lived) token.
+  // Local/token/none: the cached wsUrl is stable.
   return connection.wsUrl
 }
 
@@ -3947,10 +4036,11 @@ function readDesktopConnectionConfig() {
 
     if (parsed && typeof parsed === 'object') {
       const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
-      // authMode lives on the remote sub-object: 'oauth' (cookie + ws-ticket)
-      // or 'token' (legacy static session token). Default to 'token' for
+      // authMode lives on the remote sub-object: 'none' (trusted/public),
+      // 'oauth' (cookie + ws-ticket) or 'token' (legacy static session token).
+      // Default to 'token' for
       // backward compatibility with configs written before OAuth support.
-      remote.authMode = remote.authMode === 'oauth' ? 'oauth' : 'token'
+      remote.authMode = normAuthMode(remote.authMode)
       config = {
         mode: parsed.mode === 'remote' ? 'remote' : 'local',
         remote,
@@ -4055,9 +4145,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
 // Build + validate a `{ url, authMode, token }` remote block. OAuth gateways
 // authenticate via the login-window session cookie (verified at connect time in
-// resolveRemoteBackend), so only token-auth remotes require a saved token.
+// resolveRemoteBackend). None-auth gateways are explicitly trusted/public, so
+// only token-auth remotes require a saved token.
 function buildRemoteBlock(remoteUrl, authMode, token) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
+  if (authMode === 'token' && !decryptDesktopSecret(token)) {
     throw new Error('Remote gateway session token is required.')
   }
   return { url: normalizeRemoteBaseUrl(remoteUrl), authMode, token }
@@ -4108,6 +4199,17 @@ function coerceDesktopConnectionConfig(input = {}, existing = readDesktopConnect
 // for diagnostics ('profile' | 'env' | 'settings').
 async function buildRemoteConnection(rawUrl, authMode, token, source) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+
+  if (authMode === 'none') {
+    return {
+      baseUrl,
+      mode: 'remote',
+      source,
+      authMode: 'none',
+      token: null,
+      wsUrl: buildGatewayWsUrlWithoutAuth(baseUrl)
+    }
+  }
 
   if (authMode === 'oauth') {
     // OAuth gateway: auth comes from the session cookies in the OAuth
@@ -4182,7 +4284,7 @@ async function resolveRemoteBackend(profile) {
   //    reaches its intended backend.
   const override = profileRemoteOverride(config, profile)
   if (override) {
-    const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
+    const token = override.authMode === 'token' ? decryptDesktopSecret(override.token) : null
     return buildRemoteConnection(override.url, override.authMode, token, 'profile')
   }
 
@@ -4204,7 +4306,7 @@ async function resolveRemoteBackend(profile) {
     return null
   }
   const authMode = normAuthMode(config.remote?.authMode)
-  const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
+  const token = authMode === 'token' ? decryptDesktopSecret(config.remote?.token) : null
   return buildRemoteConnection(config.remote?.url, authMode, token, 'settings')
 }
 
@@ -4241,7 +4343,11 @@ async function requestJsonForProfile(profile, path, method, body) {
   const conn = await ensureBackend(profile)
   const url = `${conn.baseUrl}${path}`
   const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
-  return conn.authMode === 'oauth' ? fetchJsonViaOauthSession(url, opts) : fetchJson(url, conn.token, opts)
+  return conn.authMode === 'oauth'
+    ? fetchJsonViaOauthSession(url, opts)
+    : conn.authMode === 'none'
+      ? fetchPublicJson(url, opts)
+      : fetchJson(url, conn.token, opts)
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -4327,7 +4433,7 @@ async function testDesktopConnectionConfig(input = {}) {
   if (wantRemote && block?.url) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
     authMode = normAuthMode(block.authMode)
-    if (authMode !== 'oauth') {
+    if (authMode === 'token') {
       token = decryptDesktopSecret(block.token)
     }
   } else {
@@ -5221,6 +5327,12 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
+ipcMain.handle('hermes:creator-workspaces:list', async () => readCreatorWorkspacesManifest())
+ipcMain.handle('hermes:creator-workspaces:get-selection', async () => readCreatorWorkspaceSelection())
+ipcMain.handle('hermes:creator-workspaces:set-selection', async (_event, workspaceId) =>
+  writeCreatorWorkspaceSelection(workspaceId)
+)
+
 ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
   const next = writeActiveDesktopProfile(name)
@@ -5398,6 +5510,13 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // the static session-token header.
   if (connection.authMode === 'oauth') {
     return fetchJsonViaOauthSession(url, {
+      method: request?.method,
+      body: request?.body,
+      timeoutMs
+    })
+  }
+  if (connection.authMode === 'none') {
+    return fetchPublicJson(url, {
       method: request?.method,
       body: request?.body,
       timeoutMs
@@ -6216,7 +6335,23 @@ app.on('open-url', (event, url) => {
 })
 
 
+// Connect to the remote gateway DIRECTLY, bypassing any system proxy (ClashX /
+// Clash Verge). Routing the gateway through a system proxy in global mode can
+// tunnel via a far-away exit node and produce flaky TLS (handshake resets,
+// 502s, mid-stream WebSocket drops). The gateway sessions only ever talk to the
+// gateway, so forcing them direct is safe and removes the proxy as a failure
+// source.
+function applyGatewayDirectProxy(ses) {
+  if (!ses || typeof ses.setProxy !== 'function') return
+  try {
+    ses.setProxy({ mode: 'direct' }).catch(() => {})
+  } catch {
+    // older electron / already torn down
+  }
+}
+
 app.whenReady().then(() => {
+  applyGatewayDirectProxy(session.defaultSession)
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
   } else {

@@ -323,6 +323,8 @@ export interface Translations {
       authSignedInOauth: string
       authNeedsPassword: string
       authNeedsOauth: (provider: string) => string
+      noAuthPill: string
+      noAuthDesc: string
       tokenTitle: string
       tokenDesc: string
       existingToken: (value: string) => string

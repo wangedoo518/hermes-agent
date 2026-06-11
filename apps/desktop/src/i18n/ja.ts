@@ -534,6 +534,9 @@ export const ja = defineLocale({
         'このゲートウェイはユーザー名とパスワードを使用します。このデスクトップアプリを承認するにはサインインしてください。',
       authNeedsOauth: provider =>
         `このゲートウェイは OAuth を使用します。このデスクトップアプリを承認するには ${provider} でサインインしてください。`,
+      noAuthPill: 'ログインなし',
+      noAuthDesc:
+        'このゲートウェイは信頼済み workspace として設定されているため、Desktop サインインなしで使用します。',
       tokenTitle: 'セッショントークン',
       tokenDesc:
         'REST および WebSocket アクセスに使用するダッシュボードセッショントークン。保存済みトークンを維持するには空欄にしてください。',

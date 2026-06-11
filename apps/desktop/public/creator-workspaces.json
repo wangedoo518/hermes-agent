@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "workspaces": [
+    {
+      "id": "lufei",
+      "profile": "lufei-creator-profile",
+      "displayName": "路飞设计沉思录",
+      "description": "Creator workspace for the lufei profile.",
+      "gatewayUrl": "https://lufei.claudewiki.cn:8443",
+      "authMode": "oauth"
+    },
+    {
+      "id": "career-coach",
+      "profile": "career-coach-copilot",
+      "displayName": "求职咨询助手",
+      "description": "Creator workspace for career coaching sessions.",
+      "gatewayUrl": "https://career.claudewiki.cn:8443",
+      "authMode": "oauth"
+    }
+  ]
+}

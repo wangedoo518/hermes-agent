@@ -41,6 +41,7 @@ import {
 import type { RpcEvent } from '@/types/hermes'
 
 interface GatewayBootOptions {
+  enabled?: boolean
   handleGatewayEvent: (event: RpcEvent) => void
   onConnectionReady: (
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
@@ -51,6 +52,7 @@ interface GatewayBootOptions {
 }
 
 export function useGatewayBoot({
+  enabled = true,
   handleGatewayEvent,
   onConnectionReady,
   onGatewayReady,
@@ -76,6 +78,12 @@ export function useGatewayBoot({
   useEffect(() => {
     let cancelled = false
     const desktop = window.hermesDesktop
+
+    if (!enabled) {
+      setSessionsLoading(false)
+
+      return () => void (cancelled = true)
+    }
 
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
@@ -411,5 +419,5 @@ export function useGatewayBoot({
       setPrimaryGateway(null)
       $gateway.set(null)
     }
-  }, [])
+  }, [enabled])
 }

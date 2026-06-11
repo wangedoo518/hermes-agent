@@ -16,6 +16,9 @@
  *     by an HttpOnly session cookie; WS upgrades require a single-use
  *     `?ticket=` minted at POST /api/auth/ws-ticket. The gateway advertises
  *     this via the public `/api/status` field `auth_required: true`.
+ *   - 'none': creator workspace MVP mode for trusted/public gateways. REST
+ *     sends no session-token header and WS connects without token/ticket query
+ *     params. This is intentionally opt-in via config/manifest.
  */
 
 // Bare + prefixed variants of the session cookies the gateway may set,
@@ -78,6 +81,14 @@ function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
   return `${wsScheme}://${parsed.host}${prefix}/api/ws?ticket=${encodeURIComponent(ticket)}`
 }
 
+function buildGatewayWsUrlWithoutAuth(baseUrl) {
+  const parsed = new URL(baseUrl)
+  const wsScheme = parsed.protocol === 'https:' ? 'wss' : 'ws'
+  const prefix = parsed.pathname.replace(/\/+$/, '')
+
+  return `${wsScheme}://${parsed.host}${prefix}/api/ws`
+}
+
 /**
  * Build the WS URL the renderer would connect with, so the connection test can
  * exercise the same transport the app actually uses.
@@ -100,12 +111,15 @@ function buildGatewayWsUrlWithTicket(baseUrl, ticket) {
  * can't authenticate /api/ws and boot dies with "Could not connect".
  *
  * @param {string} baseUrl
- * @param {'token'|'oauth'} authMode
+ * @param {'none'|'token'|'oauth'} authMode
  * @param {string|null} token
  * @param {{ mintTicket: (baseUrl: string) => Promise<string> }} deps
  * @returns {Promise<string|null>}
  */
 async function resolveTestWsUrl(baseUrl, authMode, token, deps = {}) {
+  if (authMode === 'none') {
+    return buildGatewayWsUrlWithoutAuth(baseUrl)
+  }
   if (authMode === 'oauth') {
     const mintTicket = deps.mintTicket
     if (typeof mintTicket !== 'function') {
@@ -137,8 +151,9 @@ function connectionScopeKey(profile) {
   return String(profile ?? '').trim() || null
 }
 
-// Coerce a remote auth mode to one of the two supported values ('token' default).
+// Coerce a remote auth mode to one of the supported values ('token' default).
 function normAuthMode(mode) {
+  if (mode === 'none') return 'none'
   return mode === 'oauth' ? 'oauth' : 'token'
 }
 
@@ -188,11 +203,13 @@ function authModeFromStatus(statusBody) {
 /**
  * Resolve the effective auth mode for a coerce/save operation.
  * Explicit input wins; otherwise inherit the saved value; default 'token'.
- * Returns 'oauth' | 'token'.
+ * Returns 'none' | 'oauth' | 'token'.
  */
 function resolveAuthMode(inputAuthMode, existingAuthMode) {
+  if (inputAuthMode === 'none') return 'none'
   if (inputAuthMode === 'oauth') return 'oauth'
   if (inputAuthMode === 'token') return 'token'
+  if (existingAuthMode === 'none') return 'none'
   if (existingAuthMode === 'oauth') return 'oauth'
   return 'token'
 }
@@ -242,6 +259,7 @@ module.exports = {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  buildGatewayWsUrlWithoutAuth,
   connectionScopeKey,
   cookiesHaveSession,
   cookiesHaveLiveSession,
