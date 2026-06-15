@@ -104,9 +104,24 @@ export function useCreatorWorkspaceGate(): CreatorWorkspaceGate {
     setError(null)
 
     try {
+      // Pin this profile to its gateway (per-profile remote override)...
       await desktop.saveConnectionConfig({
         mode: 'remote',
         profile: workspace.profile,
+        remoteAuthMode: workspace.authMode,
+        remoteToken: workspace.authMode === 'token' ? token : undefined,
+        remoteUrl: workspace.gatewayUrl
+      })
+
+      // ...AND set the GLOBAL connection to remote. On a fresh install the
+      // active profile isn't resolved yet when boot is enabled, so a
+      // per-profile override alone can be missed by resolveRemoteBackend(
+      // primaryProfileKey()) and the launcher falls through to the local
+      // backend bootstrap (which clones hermes-agent from GitHub and fails on
+      // networks that can't reach github.com). Setting the global remote makes
+      // first-launch boot connect to the gateway regardless of profile timing.
+      await desktop.saveConnectionConfig({
+        mode: 'remote',
         remoteAuthMode: workspace.authMode,
         remoteToken: workspace.authMode === 'token' ? token : undefined,
         remoteUrl: workspace.gatewayUrl
