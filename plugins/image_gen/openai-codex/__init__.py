@@ -19,8 +19,10 @@ Output is saved as PNG under ``$HERMES_HOME/cache/images/``.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -143,8 +145,36 @@ def _read_codex_access_token() -> Optional[str]:
         return None
 
 
-def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[str, Any]:
-    """Build the Codex Responses request body for an image_generation call."""
+# [yby] 本地分歧:上游禁用了 codex 路径的 image-to-image,但雅百颜 mode G 依赖"参考图生图"
+# (实测 codex 后端确实接受 input_image 参考)。下面重新启用:把本地图/URL 转 input_image 注入。
+_INPUT_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def _reference_to_image_url(ref: str) -> Optional[str]:
+    """参考图 → Responses input_image.image_url。本地文件读成 data: URI;http(s)/data: 原样透传;
+    读不到返回 None(调用方跳过该张)。"""
+    if not ref:
+        return None
+    if ref.startswith("http://") or ref.startswith("https://") or ref.startswith("data:"):
+        return ref
+    try:
+        with open(ref, "rb") as fh:
+            raw = fh.read()
+    except Exception:
+        return None
+    mime = _INPUT_IMAGE_MIME.get(os.path.splitext(ref)[1].lower(), "image/png")
+    return "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+
+
+def _build_responses_payload(*, prompt: str, size: str, quality: str,
+                             image_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Build the Codex Responses request body for an image_generation call.
+
+    [yby] image_urls 非空时,每张作为 input_image 附加,供 gpt-image-2 作参考(edit/style 条件)。"""
+    content: List[Dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+    for url in (image_urls or []):
+        content.append({"type": "input_image", "image_url": url})
     return {
         "model": _CODEX_CHAT_MODEL,
         "store": False,
@@ -152,7 +182,7 @@ def _build_responses_payload(*, prompt: str, size: str, quality: str) -> Dict[st
         "input": [{
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": content,
         }],
         "tools": [{
             "type": "image_generation",
@@ -242,7 +272,8 @@ def _iter_sse_json(response: Any):
         yield payload
 
 
-def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> Optional[str]:
+def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str,
+                       image_urls: Optional[List[str]] = None) -> Optional[str]:
     """Stream a Codex Responses image_generation call and return the b64 image."""
     import httpx
     from agent.auxiliary_client import _codex_cloudflare_headers
@@ -253,7 +284,8 @@ def _collect_image_b64(token: str, *, prompt: str, size: str, quality: str) -> O
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     })
-    payload = _build_responses_payload(prompt=prompt, size=size, quality=quality)
+    payload = _build_responses_payload(prompt=prompt, size=size, quality=quality,
+                                       image_urls=image_urls)
     timeout = httpx.Timeout(300.0, connect=30.0, read=300.0, write=30.0, pool=30.0)
 
     image_b64: Optional[str] = None
@@ -328,12 +360,9 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         }
 
     def capabilities(self) -> Dict[str, Any]:
-        # The Codex Responses image_generation tool path is text-to-image
-        # only here. Image-to-image / editing via Codex OAuth is not wired —
-        # users who need editing should use the `openai` (API key), `fal`, or
-        # `xai` backends. Declaring text-only keeps the dynamic tool schema
-        # honest so the model doesn't attempt an unsupported edit.
-        return {"modalities": ["text"], "max_reference_images": 0}
+        # [yby] 本地分歧:已重新启用 codex 参考图(input_image 注入),供雅百颜 mode G 用。
+        # 上游默认 text-only;此处声明支持参考图以保持工具 schema 一致。
+        return {"modalities": ["text", "image"], "max_reference_images": 4}
 
     def generate(
         self,
@@ -347,20 +376,14 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
 
-        # Image-to-image / editing is not supported on the Codex OAuth path.
-        # Surface a clear, actionable error instead of silently ignoring the
-        # source image and producing an unrelated picture.
-        if (isinstance(image_url, str) and image_url.strip()) or reference_image_urls:
-            return error_response(
-                error=(
-                    "This model is not capable of image-to-image / editing. "
-                    "Please provide a text-only prompt (drop image_url and "
-                    "reference_image_urls)."
-                ),
-                error_type="modality_unsupported",
-                provider="openai-codex",
-                aspect_ratio=aspect,
-            )
+        # [yby] 本地分歧:重新启用 codex 参考图生图(上游禁用)。汇总参考图:
+        # image_url / reference_image_urls(上游 API) + kwargs['reference_images'](雅百颜 runner 传)。
+        _refs_in: List[str] = []
+        if isinstance(image_url, str) and image_url.strip():
+            _refs_in.append(image_url.strip())
+        _refs_in.extend(reference_image_urls or [])
+        _refs_in.extend(kwargs.get("reference_images") or [])
+        image_urls = [u for u in (_reference_to_image_url(r) for r in _refs_in) if u]
 
         if not prompt:
             return error_response(
@@ -414,6 +437,7 @@ class OpenAICodexImageGenProvider(ImageGenProvider):
                 prompt=prompt,
                 size=size,
                 quality=meta["quality"],
+                image_urls=image_urls or None,
             )
         except Exception as exc:
             logger.debug("Codex image generation failed", exc_info=True)
