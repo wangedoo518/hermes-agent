@@ -16,6 +16,14 @@
       "description": "Creator workspace for career coaching sessions.",
       "gatewayUrl": "https://career.claudewiki.cn:8443",
       "authMode": "oauth"
+    },
+    {
+      "id": "yabaiyan",
+      "profile": "yabaiyan-creator-profile",
+      "displayName": "雅百颜小红书运营",
+      "description": "Creator workspace for 雅百颜 XHS operations (scout / studio / writer).",
+      "gatewayUrl": "http://127.0.0.1:9121",
+      "authMode": "token"
     }
   ]
 }
